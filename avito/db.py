@@ -7,6 +7,7 @@ Streamlit Community Cloud эфемерна, поэтому при деплое �
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -90,17 +91,45 @@ calls = Table(
 LISTING_FIELDS = [c.name for c in listings.columns if c.name not in ("id", "upload_id")]
 
 
+def _postgres_driver() -> str:
+    """Первый установленный драйвер Postgres.
+
+    Готовые сборки psycopg2 отстают от новых версий Python, поэтому драйвер не
+    зашит в строку подключения, а выбирается из доступных.
+    """
+    for module in ("psycopg", "psycopg2", "pg8000"):
+        if importlib.util.find_spec(module) is not None:
+            return module
+    return "psycopg"
+
+
+def normalize_url(url: str) -> str:
+    """Приводит строку подключения к рабочему виду.
+
+    Строку можно копировать из панели Neon или Supabase как есть: префикс
+    «postgres://», «postgresql://» или «postgresql+psycopg2://» одинаково
+    приводится к драйверу, который реально установлен.
+    """
+    url = url.strip()
+    scheme, separator, rest = url.partition("://")
+    if not separator:
+        return url
+    if scheme.split("+", 1)[0] in ("postgres", "postgresql"):
+        return f"postgresql+{_postgres_driver()}://{rest}"
+    return url
+
+
 def database_url() -> str:
     url = os.environ.get("DASHBOARD_DB_URL", "").strip()
     if url:
-        return url
+        return normalize_url(url)
     path = Path(__file__).resolve().parent.parent / "data" / "stats.db"
     path.parent.mkdir(parents=True, exist_ok=True)
     return f"sqlite:///{path.as_posix()}"
 
 
 def get_engine(url: str | None = None) -> Engine:
-    url = url or database_url()
+    url = normalize_url(url) if url else database_url()
     kwargs = {"future": True, "pool_pre_ping": True}
     if url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}

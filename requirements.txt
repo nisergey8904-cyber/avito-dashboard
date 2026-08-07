@@ -3,6 +3,11 @@ pandas>=2.2
 plotly>=5.24
 sqlalchemy>=2.0
 openpyxl>=3.1
-# Драйвер Postgres. Нужен в облаке: файловая система Streamlit Cloud
+# Драйверы Postgres. Нужны в облаке: файловая система Streamlit Cloud
 # очищается при перезапуске, поэтому данные хранятся во внешней базе.
-psycopg2-binary>=2.9
+# psycopg 3 — основной; у psycopg2-binary нет сборок под Python 3.14,
+# на котором работает Streamlit Cloud.
+psycopg[binary]>=3.2
+# Запасной драйвер на чистом Python: встаёт где угодно, даже если готовой
+# бинарной сборки psycopg под очередную версию Python ещё нет.
+pg8000>=1.31
