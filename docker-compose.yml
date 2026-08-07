@@ -1,0 +1,10 @@
+services:
+  dashboard:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      # База переживает перезапуск и пересборку контейнера.
+      - ./data:/app/data
+      - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro

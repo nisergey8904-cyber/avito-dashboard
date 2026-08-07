@@ -1,0 +1,13 @@
+# Данные и секреты не должны попадать в репозиторий
+data/
+*.db
+*.sqlite3
+*.xlsx
+.streamlit/secrets.toml
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.DS_Store
