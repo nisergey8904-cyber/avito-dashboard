@@ -11,6 +11,7 @@ import importlib.util
 import os
 from datetime import date, datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pandas as pd
 from sqlalchemy import (
@@ -103,6 +104,44 @@ def _postgres_driver() -> str:
     return "psycopg"
 
 
+class DatabaseConfigError(RuntimeError):
+    """Строка подключения задана неверно — сообщение показывается пользователю."""
+
+
+def _check_postgres_target(url: str) -> None:
+    """Ловит типовые ошибки в строке подключения до попытки соединиться.
+
+    Иначе они всплывают глубоко внутри драйвера в виде невнятных исключений
+    вроде UnicodeEncodeError из кодировщика доменных имён.
+    """
+    parts = urlsplit(url)
+    try:
+        host = parts.hostname
+    except ValueError as exc:
+        raise DatabaseConfigError(
+            f"Адрес базы не разбирается: {exc}. Скопируйте строку подключения "
+            "из панели Neon заново."
+        ) from exc
+
+    if not host:
+        raise DatabaseConfigError(
+            "В строке подключения не указан адрес сервера базы. Скопируйте "
+            "строку целиком из панели Neon: Dashboard → Connection Details."
+        )
+    if "..." in url or ".." in host:
+        raise DatabaseConfigError(
+            f"В адресе сервера («{host}») стоит многоточие — похоже, в секреты "
+            "попал пример из инструкции, а не настоящая строка подключения. "
+            "Возьмите её в панели Neon: Dashboard → Connection Details → "
+            "Connection string."
+        )
+    if any(word in url for word in ("имя:пароль", "ВАШ_ЛОГИН", "user:pass")):
+        raise DatabaseConfigError(
+            "В строке подключения остались слова-заглушки вместо логина и "
+            "пароля. Скопируйте настоящую строку из панели Neon."
+        )
+
+
 def normalize_url(url: str) -> str:
     """Приводит строку подключения к рабочему виду.
 
@@ -115,7 +154,8 @@ def normalize_url(url: str) -> str:
     if not separator:
         return url
     if scheme.split("+", 1)[0] in ("postgres", "postgresql"):
-        return f"postgresql+{_postgres_driver()}://{rest}"
+        url = f"postgresql+{_postgres_driver()}://{rest}"
+        _check_postgres_target(url)
     return url
 
 

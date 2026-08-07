@@ -37,6 +37,33 @@ def engine():
     return db.get_engine()
 
 
+def connect_or_explain():
+    """Подключается к базе, а при неудаче объясняет причину вместо трейса."""
+    try:
+        return engine()
+    except db.DatabaseConfigError as exc:
+        st.title("📊 Статистика Авито")
+        st.error(str(exc), icon="⚠️")
+        st.markdown(
+            "Строка подключения задаётся в настройках приложения: "
+            "**Manage app → Settings → Secrets**, параметр `db_url`. "
+            "После сохранения приложение перезапустится само."
+        )
+        st.stop()
+    except Exception as exc:  # noqa: BLE001 — показываем причину, а не трейс
+        st.title("📊 Статистика Авито")
+        st.error("Не удалось подключиться к базе данных.", icon="⚠️")
+        st.caption(f"Ответ драйвера: {type(exc).__name__}: {exc}"[:500])
+        st.markdown(
+            "Что проверить:\n"
+            "- в секрете `db_url` указана строка из панели Neon целиком, "
+            "вместе с `?sslmode=require`;\n"
+            "- проект в Neon не удалён и не приостановлен;\n"
+            "- пароль в строке не был изменён после копирования."
+        )
+        st.stop()
+
+
 def authenticate() -> str:
     """Возвращает роль: 'admin' или 'viewer'.
 
@@ -68,7 +95,7 @@ def authenticate() -> str:
 
 def main() -> None:
     role = authenticate()
-    eng = engine()
+    eng = connect_or_explain()
 
     with st.sidebar:
         st.title("📊 Статистика Авито")
