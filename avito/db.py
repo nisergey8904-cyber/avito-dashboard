@@ -197,18 +197,33 @@ def init_db(engine: Engine) -> None:
 
 
 def _migrate(engine: Engine) -> None:
-    """Догоняет схему в базах, созданных прежней версией приложения."""
+    """Догоняет схему в базах, созданных прежней версией приложения.
+
+    Схема сначала целиком читается, и только потом выполняются DDL — каждое
+    отдельной короткой транзакцией. Держать транзакцию открытой, пока в неё
+    вклинивается чтение схемы, нельзя: под Postgres «DROP TABLE uploads»
+    блокирует и accounts (внешний ключ), чтение с другого соединения встаёт в
+    очередь за этой блокировкой, и транзакция ждёт сама себя, пока сервер не
+    оборвёт соединение по idle-in-transaction timeout.
+    """
     inspector = inspect(engine)
     present = set(inspector.get_table_names())
+    account_columns = ({c["name"] for c in inspector.get_columns("accounts")}
+                       if "accounts" in present else set())
 
-    with engine.begin() as conn:
-        for table in LEGACY_TABLES:
-            if table in present:
-                conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
-        if "accounts" in present:
-            columns = {c["name"] for c in inspector.get_columns("accounts")}
-            if "avito_id" not in columns:
-                conn.execute(text("ALTER TABLE accounts ADD COLUMN avito_id VARCHAR(40)"))
+    statements = [f"DROP TABLE IF EXISTS {table}"
+                  for table in LEGACY_TABLES if table in present]
+    if "accounts" in present and "avito_id" not in account_columns:
+        # IF NOT EXISTS — на случай, если колонку успел добавить параллельный
+        # процесс приложения: SQLite такого синтаксиса не понимает, но там
+        # одновременных запусков не бывает.
+        exists_clause = "IF NOT EXISTS " if engine.dialect.name == "postgresql" else ""
+        statements.append(
+            f"ALTER TABLE accounts ADD COLUMN {exists_clause}avito_id VARCHAR(40)")
+
+    for statement in statements:
+        with engine.begin() as conn:
+            conn.execute(text(statement))
 
 
 # --- аккаунты ---------------------------------------------------------------
