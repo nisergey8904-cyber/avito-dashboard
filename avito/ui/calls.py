@@ -14,7 +14,7 @@ from avito.ui.common import bump_data_version, cached_accounts, data_version
 def calls_page(engine) -> None:
     st.header("Звонки")
     st.caption("Фактические звонки вводятся вручную: одна строка — день и аккаунт. "
-               "Дашборд соотносит их с периодами выгрузок автоматически.")
+               "Дашборд подхватывает их за выбранный в календаре период.")
 
     accounts = cached_accounts(engine, data_version())
     name_by_id = dict(zip(accounts["id"], accounts["name"]))

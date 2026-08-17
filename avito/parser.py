@@ -1,8 +1,10 @@
-"""Разбор недельных выгрузок Авито (xlsx).
+"""Разбор дневных выгрузок Авито (xlsx).
 
-Схема выгрузки нестабильна: в части файлов присутствует колонка «Сотрудник»,
-в части — нет, поэтому колонки сопоставляются по нормализованным заголовкам,
-а не по позициям. В заголовках Авито использует неразрывные пробелы (\\xa0).
+Ожидается файл за один день — «Статистика_за_2026-07-23 (1).xlsx»: дата берётся
+из имени, внутри файла её нет. Схема выгрузки нестабильна: в части файлов
+присутствует колонка «Сотрудник», в части — нет, поэтому колонки сопоставляются
+по нормализованным заголовкам, а не по позициям. В заголовках Авито использует
+неразрывные пробелы (\\xa0).
 """
 
 from __future__ import annotations
@@ -58,18 +60,19 @@ NUMERIC = [
     "avg_view_price", "avg_contact_price",
 ]
 
-_PERIOD_RE = re.compile(r"(\d{4}-\d{2}-\d{2}).*?(\d{4}-\d{2}-\d{2})")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _PRICE_RE = re.compile(r"\d+")
 
 
 class ParseError(ValueError):
-    """Файл не похож на выгрузку Авито или не читается."""
+    """Файл не похож на дневную выгрузку Авито или не читается."""
 
 
 @dataclass(frozen=True)
-class ParsedUpload:
-    period_start: date
-    period_end: date
+class ParsedDay:
+    """Разобранный файл. stat_date=None — даты в имени нет, её задаёт пользователь."""
+
+    stat_date: date | None
     rows: pd.DataFrame
 
 
@@ -79,20 +82,29 @@ def _norm_header(value: object) -> str:
     return value.replace("\xa0", " ").replace(" ", " ").strip()
 
 
-def period_from_filename(filename: str) -> tuple[date, date] | None:
-    """Достаёт период из имени вида «Статистика_с_2026-08-01_по_2026-08-07 (1).xlsx».
+def date_from_filename(filename: str) -> date | None:
+    """Достаёт день из имени вида «Статистика_за_2026-07-23 (1).xlsx».
 
-    Возвращает None, если дат в имени нет — тогда период задаёт пользователь.
+    Возвращает None, если дат в имени нет — тогда день задаёт пользователь.
+    Несколько разных дат — это выгрузка за период: разложить её по дням
+    невозможно, поэтому такой файл отклоняется, а не сваливается в один день.
     """
-    match = _PERIOD_RE.search(filename)
-    if not match:
+    found = set()
+    for chunk in _DATE_RE.findall(filename):
+        try:
+            found.add(datetime.strptime(chunk, "%Y-%m-%d").date())
+        except ValueError:
+            continue
+    if not found:
         return None
-    try:
-        start = datetime.strptime(match.group(1), "%Y-%m-%d").date()
-        end = datetime.strptime(match.group(2), "%Y-%m-%d").date()
-    except ValueError:
-        return None
-    return (start, end) if start <= end else (end, start)
+    if len(found) > 1:
+        first, last = min(found), max(found)
+        raise ParseError(
+            f"Это выгрузка за период {first:%d.%m.%Y}–{last:%d.%m.%Y}, а нужны "
+            "данные за один день. В Авито выгрузите статистику по дням: "
+            "имя файла должно быть вида «Статистика_за_2026-07-23.xlsx»."
+        )
+    return found.pop()
 
 
 def parse_price(value: object) -> float | None:
@@ -118,8 +130,9 @@ def _to_date(value: object) -> date | None:
         return None
 
 
-def parse_workbook(source, filename: str = "") -> ParsedUpload:
+def parse_workbook(source, filename: str = "") -> ParsedDay:
     """Читает xlsx (путь или файловый объект) в нормализованный DataFrame."""
+    stat_date = date_from_filename(filename)  # период в имени — ошибка сразу
     try:
         raw = pd.read_excel(source, sheet_name=0, engine="openpyxl")
     except Exception as exc:  # noqa: BLE001 — показываем пользователю причину как есть
@@ -158,14 +171,4 @@ def parse_workbook(source, filename: str = "") -> ParsedUpload:
     if df.empty:
         raise ParseError("В файле нет строк с данными.")
 
-    period = period_from_filename(filename)
-    if period is None:
-        published = [d for d in df.get("first_published", []) if isinstance(d, date)]
-        if not published:
-            raise ParseError(
-                "Не удалось определить период: в имени файла нет дат "
-                "и в данных нет дат публикации. Укажите период вручную."
-            )
-        period = (min(published), max(published))
-
-    return ParsedUpload(period_start=period[0], period_end=period[1], rows=df)
+    return ParsedDay(stat_date=stat_date, rows=df)

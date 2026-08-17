@@ -1,8 +1,9 @@
-"""Загрузка недельных выгрузок Авито."""
+"""Загрузка дневных выгрузок Авито."""
 
 from __future__ import annotations
 
 import io
+from datetime import date
 
 import pandas as pd
 import streamlit as st
@@ -10,7 +11,8 @@ import streamlit as st
 from avito import db
 from avito.parser import ParseError, parse_workbook
 from avito.ui.common import (
-    bump_data_version, cached_accounts, data_version, fmt_int, fmt_money,
+    bump_data_version, cached_accounts, cached_days, data_version, fmt_int,
+    fmt_money,
 )
 
 
@@ -29,9 +31,9 @@ def _preview_line(rows: pd.DataFrame) -> str:
 
 def upload_page(engine) -> None:
     st.header("Загрузка выгрузок")
-    st.caption("Перетащите файлы выгрузки из Авито и укажите, какому аккаунту "
-               "принадлежит каждый. Повторная загрузка того же периода заменит "
-               "прежние данные.")
+    st.caption("Нужны выгрузки за один день — «Статистика_за_2026-07-23.xlsx». "
+               "Дата берётся из имени файла, аккаунт указывается здесь. "
+               "Повторная загрузка того же дня заменит прежние данные.")
 
     accounts = cached_accounts(engine, data_version())
     name_by_id = dict(zip(accounts["id"], accounts["name"]))
@@ -39,12 +41,20 @@ def upload_page(engine) -> None:
     files = st.file_uploader("Файлы выгрузки (.xlsx)", type=["xlsx"],
                              accept_multiple_files=True)
     if not files:
-        _uploads_table(engine)
+        _days_table(engine)
         return
 
-    plans = []
     st.subheader("Что будет загружено")
-    for index, uploaded in enumerate(files):
+    same_account = st.checkbox(
+        "Все файлы одного аккаунта", value=True,
+        help="Обычно за раз загружают папку дней одного кабинета Авито.")
+    shared_account = None
+    if same_account:
+        shared_account = st.selectbox("Аккаунт", list(name_by_id),
+                                      format_func=lambda i: name_by_id[i])
+
+    plans = []
+    for uploaded in files:
         payload = uploaded.getvalue()
         try:
             parsed = _parse_cached(payload, uploaded.name)
@@ -55,84 +65,104 @@ def upload_page(engine) -> None:
         with st.container(border=True):
             st.markdown(f"**{uploaded.name}**")
             st.caption(_preview_line(parsed.rows))
-            columns = st.columns([2, 1.2, 1.2])
-            account_id = columns[0].selectbox(
-                "Аккаунт", list(name_by_id), key=f"acc_{index}",
-                format_func=lambda i: name_by_id[i],
+            if same_account:
+                account_id = shared_account
+                day_cell = st.container()
+            else:
+                account_cell, day_cell = st.columns([2, 1.4])
+                account_id = account_cell.selectbox(
+                    "Аккаунт", list(name_by_id), key=f"acc_{uploaded.name}",
+                    format_func=lambda i: name_by_id[i],
+                )
+            if parsed.stat_date is None:
+                day_cell.warning("В имени файла нет даты — укажите день вручную.",
+                                 icon="📅")
+            # Ключ включает файл и распознанный день: иначе Streamlit оставил бы
+            # в поле дату от файла, который был на этом месте в прошлый раз.
+            day = day_cell.date_input(
+                "День", parsed.stat_date or date.today(), format="DD.MM.YYYY",
+                key=f"day_{uploaded.name}_{parsed.stat_date}",
             )
-            start = columns[1].date_input("Начало периода", parsed.period_start,
-                                          key=f"start_{index}", format="DD.MM.YYYY")
-            end = columns[2].date_input("Конец периода", parsed.period_end,
-                                        key=f"end_{index}", format="DD.MM.YYYY")
-            plans.append((uploaded.name, account_id, start, end, parsed.rows))
+            plans.append((uploaded.name, account_id, day, parsed.rows))
 
     if not plans:
         return
 
-    duplicates = _duplicate_targets(plans)
+    duplicates = _duplicate_targets(plans, name_by_id)
     if duplicates:
-        st.warning("Один и тот же аккаунт выбран для нескольких файлов с одинаковым "
-                   "периодом: " + "; ".join(duplicates)
+        st.warning("Один и тот же аккаунт и день выбраны для нескольких файлов: "
+                   + "; ".join(duplicates)
                    + ". Сохранится только последний — проверьте выбор.")
 
     if st.button("Импортировать", type="primary"):
-        saved, replaced = 0, 0
-        for filename, account_id, start, end, rows in plans:
-            if start > end:
-                st.error(f"**{filename}** — начало периода позже конца.")
-                continue
-            _, was_replaced = db.save_upload(engine, account_id, start, end,
-                                             filename, rows)
+        saved, replaced, rows_total = 0, 0, 0
+        for filename, account_id, day, rows in plans:
+            count, was_replaced = db.save_day(engine, account_id, day, filename, rows)
             saved += 1
+            rows_total += count
             replaced += int(was_replaced)
         bump_data_version()
-        message = f"Загружено файлов: {saved}."
+        message = f"Загружено файлов: {saved}, строк: {fmt_int(rows_total)}."
         if replaced:
-            message += f" Из них заменили прежние данные: {replaced}."
+            message += f" Дней перезаписано: {replaced}."
         st.success(message)
         st.rerun()
 
-    _uploads_table(engine)
+    _days_table(engine)
 
 
-def _duplicate_targets(plans) -> list[str]:
+def _duplicate_targets(plans, name_by_id: dict[int, str]) -> list[str]:
     seen: dict[tuple, int] = {}
-    for _, account_id, start, end, _rows in plans:
-        seen[(account_id, start, end)] = seen.get((account_id, start, end), 0) + 1
-    return [f"{key[0]} / {key[1]:%d.%m.%Y}–{key[2]:%d.%m.%Y}"
-            for key, count in seen.items() if count > 1]
+    for _, account_id, day, _rows in plans:
+        seen[(account_id, day)] = seen.get((account_id, day), 0) + 1
+    return [f"{name_by_id.get(account_id, account_id)} / {day:%d.%m.%Y}"
+            for (account_id, day), count in seen.items() if count > 1]
 
 
-def _uploads_table(engine) -> None:
+def _days_table(engine) -> None:
     st.divider()
-    st.subheader("Загруженные выгрузки")
-    uploads = db.list_uploads(engine)
-    if uploads.empty:
+    st.subheader("Загруженные дни")
+    days = cached_days(engine, data_version())
+    if days.empty:
         st.info("Пока ничего не загружено.")
         return
 
-    table = uploads.copy()
-    table["Период"] = (pd.to_datetime(table["period_start"]).dt.strftime("%d.%m.%Y")
-                       + " – "
-                       + pd.to_datetime(table["period_end"]).dt.strftime("%d.%m.%Y"))
-    table["Загружено"] = pd.to_datetime(table["uploaded_at"]).dt.strftime("%d.%m.%Y %H:%M")
+    summary = st.columns(3)
+    summary[0].metric("Дней с данными", days["stat_date"].nunique())
+    summary[1].metric("Строк всего", fmt_int(days["rows_count"].sum()))
+    summary[2].metric("Последний день", f"{days['stat_date'].max():%d.%m.%Y}")
+
+    table = days.copy()
+    table["День"] = table["stat_date"].dt.strftime("%d.%m.%Y")
+    table["Загружено"] = table["imported_at"].dt.strftime("%d.%m.%Y %H:%M")
     st.dataframe(
-        table[["account", "Период", "rows_count", "filename", "Загружено"]]
+        table[["account", "День", "rows_count", "source_file", "Загружено"]]
         .rename(columns={"account": "Аккаунт", "rows_count": "Строк",
-                         "filename": "Файл"}),
-        width="stretch", hide_index=True,
+                         "source_file": "Файл"}),
+        width="stretch", hide_index=True, height=320,
     )
 
-    with st.expander("Удалить выгрузку"):
-        labels = {
-            int(row.id): f"{row.account} · {row.period_start:%d.%m.%Y}–"
-                         f"{row.period_end:%d.%m.%Y} · {row.filename}"
-            for row in uploads.itertuples()
-        }
-        target = st.selectbox("Выгрузка", list(labels),
-                              format_func=lambda i: labels[i])
-        if st.button("Удалить", type="secondary"):
-            db.delete_upload(engine, target)
-            bump_data_version()
-            st.success("Выгрузка удалена.")
-            st.rerun()
+    with st.expander("Удалить данные"):
+        accounts_in_data = (days[["account_id", "account"]].drop_duplicates()
+                           .sort_values("account"))
+        target_account = st.selectbox(
+            "Аккаунт", accounts_in_data["account_id"].tolist(),
+            format_func=lambda i: accounts_in_data.loc[
+                accounts_in_data["account_id"] == i, "account"].iloc[0],
+            key="delete_account",
+        )
+        own = days[days["account_id"] == target_account]
+        first = own["stat_date"].min().date()
+        last = own["stat_date"].max().date()
+        chosen = st.date_input("Дни к удалению", (first, last), min_value=first,
+                               max_value=last, format="DD.MM.YYYY",
+                               key="delete_range")
+        if isinstance(chosen, (tuple, list)) and len(chosen) == 2:
+            start, end = chosen
+            if st.button(f"Удалить {start:%d.%m.%Y}–{end:%d.%m.%Y}", type="secondary"):
+                removed = db.delete_range(engine, int(target_account), start, end)
+                bump_data_version()
+                st.success(f"Удалено строк: {fmt_int(removed)}.")
+                st.rerun()
+        else:
+            st.caption("Выберите вторую дату интервала.")

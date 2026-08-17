@@ -15,8 +15,10 @@ RU_LABELS = {
     "account": "Аккаунт",
     "region": "Регион",
     "city": "Город",
-    "period": "Период",
-    "listings": "Объявлений",
+    "stat_date": "Дата",
+    "rows": "Строк",
+    "days": "Дней",
+    "listings_per_day": "Объявлений в день",
     "impressions": "Показы",
     "views": "Просмотры",
     "contacts": "Контакты",
@@ -52,72 +54,91 @@ def add_derived(df: pd.DataFrame) -> pd.DataFrame:
     out["cost_per_view"] = _safe_div(out["spend_total"], out["views"])
     out["cost_per_contact"] = _safe_div(out["spend_total"], out["contacts"])
     out["cost_per_call"] = _safe_div(out["spend_total"], out["calls"])
+    if "rows" in out.columns and "days" in out.columns:
+        out["listings_per_day"] = _safe_div(out["rows"], out["days"])
     return out
 
 
-def aggregate(listings: pd.DataFrame, by: list[str]) -> pd.DataFrame:
-    """Суммирует метрики по срезу и считает число объявлений."""
-    if listings.empty:
-        return pd.DataFrame(columns=by + SUM_COLUMNS + ["listings"])
-    present = [c for c in SUM_COLUMNS if c in listings.columns]
-    grouped = listings.groupby(by, dropna=False, observed=True)
-    out = grouped[present].sum().reset_index()
-    out["listings"] = grouped.size().reset_index(name="n")["n"]
-    return out
+def aggregate(rows: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    """Суммирует метрики по срезу.
 
-
-def period_label(start, end) -> str:
-    start, end = pd.Timestamp(start), pd.Timestamp(end)
-    return f"{start:%d.%m} – {end:%d.%m.%Y}"
-
-
-def calls_by_period(calls: pd.DataFrame, periods: pd.DataFrame) -> pd.DataFrame:
-    """Раскладывает подневные звонки по периодам выгрузок.
-
-    periods — уникальные (account_id, period_start, period_end). Звонок относится
-    к периоду, если его дата попадает в интервал включительно.
+    rows — число строк выгрузки, days — сколько разных дней в них попало. Одно
+    объявление даёт по строке за каждый день, поэтому «сколько объявлений» —
+    это rows/days (см. add_derived), а не число строк.
     """
-    columns = ["account_id", "period_start", "period_end", "calls", "deals"]
-    if periods.empty:
-        return pd.DataFrame(columns=columns)
-    if calls.empty:
-        result = periods.copy()
-        result["calls"] = 0
-        result["deals"] = 0
-        return result[columns]
-
-    merged = periods.merge(calls, on="account_id", how="left")
-    inside = merged["call_date"].between(merged["period_start"], merged["period_end"])
-    merged.loc[~inside, ["calls", "deals"]] = 0
-    result = (merged.groupby(["account_id", "period_start", "period_end"],
-                             dropna=False)[["calls", "deals"]]
-              .sum().reset_index())
-    return result[columns]
-
-
-def attach_calls(agg: pd.DataFrame, calls_agg: pd.DataFrame,
-                 keys: list[str]) -> pd.DataFrame:
-    """Присоединяет звонки к агрегату по общим ключам (аккаунт и/или период)."""
-    out = agg.copy()
-    if calls_agg.empty or not keys:
-        out["calls"] = 0
-        out["deals"] = 0
-        return out
-    trimmed = calls_agg.groupby(keys, dropna=False)[["calls", "deals"]].sum().reset_index()
-    out = out.merge(trimmed, on=keys, how="left")
-    out[["calls", "deals"]] = out[["calls", "deals"]].fillna(0)
+    if rows.empty:
+        return pd.DataFrame(columns=by + SUM_COLUMNS + ["rows", "days"])
+    present = [c for c in SUM_COLUMNS if c in rows.columns]
+    grouped = rows.groupby(by, dropna=False, observed=True)
+    out = grouped[present].sum().reset_index()
+    out["rows"] = grouped.size().to_numpy()
+    out["days"] = (grouped["stat_date"].nunique().to_numpy()
+                   if "stat_date" in rows.columns else 1)
     return out
 
 
-def funnel_totals(listings: pd.DataFrame, calls_total: float) -> dict[str, float]:
+def range_label(start, end) -> str:
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    if start == end:
+        return f"{start:%d.%m.%Y}"
+    return f"{start:%d.%m.%Y} – {end:%d.%m.%Y}"
+
+
+def bucket(dates: pd.Series, freq: str) -> pd.Series:
+    """Сводит даты к началу недели или месяца — для графика динамики.
+
+    freq: «D» — как есть, «W» — понедельник недели, «M» — первое число месяца.
+    """
+    if freq == "W":
+        # «W» в pandas — неделя, заканчивающаяся воскресеньем, то есть start_time
+        # приходится на понедельник. С «W-MON» неделя начиналась бы со вторника.
+        return dates.dt.to_period("W").dt.start_time
+    if freq == "M":
+        return dates.dt.to_period("M").dt.start_time
+    return dates
+
+
+def _calls_in_range(calls: pd.DataFrame, start, end) -> pd.DataFrame:
+    """Звонки, попавшие в интервал включительно."""
+    if calls.empty:
+        return calls
+    inside = calls["call_date"].between(pd.Timestamp(start), pd.Timestamp(end))
+    return calls[inside]
+
+
+def calls_by_account(calls: pd.DataFrame, start, end) -> pd.DataFrame:
+    """Звонки за интервал, просуммированные по аккаунтам."""
+    picked = _calls_in_range(calls, start, end)
+    if picked.empty:
+        return pd.DataFrame(columns=["account_id", "account", "calls", "deals"])
+    return (picked.groupby(["account_id", "account"], dropna=False)[["calls", "deals"]]
+            .sum().reset_index())
+
+
+def calls_by_day(calls: pd.DataFrame, start, end) -> pd.DataFrame:
+    """Звонки за интервал по дням и аккаунтам."""
+    columns = ["account", "stat_date", "calls", "deals"]
+    picked = _calls_in_range(calls, start, end)
+    if picked.empty:
+        return pd.DataFrame(columns=columns)
+    out = (picked.groupby(["account", "call_date"], dropna=False)[["calls", "deals"]]
+           .sum().reset_index()
+           .rename(columns={"call_date": "stat_date"}))
+    return out[columns]
+
+
+def funnel_totals(rows: pd.DataFrame, calls_total: float) -> dict[str, float]:
     """Сводные числа для карточек и воронки."""
     def total(col: str) -> float:
-        return float(listings[col].sum()) if col in listings.columns else 0.0
+        return float(rows[col].sum()) if col in rows.columns else 0.0
 
     impressions, views = total("impressions"), total("views")
     contacts, spend = total("contacts"), total("spend_total")
+    days = int(rows["stat_date"].nunique()) if "stat_date" in rows.columns else 0
     return {
-        "listings": int(len(listings)),
+        "rows": int(len(rows)),
+        "days": days,
+        "listings_per_day": len(rows) / days if days else np.nan,
         "impressions": impressions,
         "views": views,
         "contacts": contacts,

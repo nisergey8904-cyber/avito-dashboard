@@ -1,6 +1,12 @@
-"""Главный экран: воронка, экономика и сравнение аккаунтов."""
+"""Главный экран: воронка, экономика и сравнение аккаунтов.
+
+Период задаётся календарём: данные лежат подневно, поэтому любой интервал —
+от одного дня до всей истории — собирается на лету.
+"""
 
 from __future__ import annotations
+
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.express as px
@@ -9,68 +15,98 @@ import streamlit as st
 
 from avito import metrics
 from avito.ui.common import (
-    DASH, bump_data_version, cached_calls, cached_listings, data_version,
-    fmt_int, fmt_money, fmt_pct,
+    DASH, bump_data_version, cached_bounds, cached_calls, cached_daily,
+    data_version, fmt_int, fmt_money, fmt_pct,
 )
 
 PALETTE = ["#2E6FD9", "#00A87E", "#F2A93B", "#D9534F", "#7B5AA6", "#4BB3C4"]
 
+# Выбранный интервал хранится в обычном ключе сессии, а не в ключе виджета:
+# значение виджета Streamlit запрещает менять из кода после первой отрисовки,
+# а кнопкам быстрого выбора это нужно на каждом перезапуске.
+RANGE_KEY = "dashboard_range"
 
-def _period_options(listings: pd.DataFrame) -> pd.DataFrame:
-    periods = (listings[["period_start", "period_end"]]
-               .drop_duplicates()
-               .sort_values("period_start", ascending=False)
-               .reset_index(drop=True))
-    periods["label"] = [metrics.period_label(s, e)
-                        for s, e in zip(periods.period_start, periods.period_end)]
-    return periods
+# Быстрый выбор: подпись -> сколько последних дней истории брать (None — всю).
+QUICK_RANGES = {"7 дней": 7, "30 дней": 30, "90 дней": 90, "Всё время": None}
+
+GRANULARITY = {"По дням": "D", "По неделям": "W", "По месяцам": "M"}
 
 
-def _filters(listings: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    periods = _period_options(listings)
-    accounts = sorted(listings["account"].unique())
+def _default_range(first: date, last: date) -> tuple[date, date]:
+    return max(first, last - timedelta(days=29)), last
 
-    left, middle, right = st.columns([2, 2, 1.4])
-    with left:
-        chosen_labels = st.multiselect(
-            "Период выгрузки", periods["label"].tolist(),
-            default=periods["label"].tolist(),
-            help="По умолчанию — все загруженные периоды.",
+
+def _remembered_range(first: date, last: date) -> tuple[date, date]:
+    """Прошлый выбор, подрезанный под доступные даты.
+
+    Новые данные сдвигают границы календаря, а в сессии может лежать интервал
+    за их пределами — date_input на таком значении падает.
+    """
+    stored = st.session_state.get(RANGE_KEY)
+    if isinstance(stored, (tuple, list)) and len(stored) == 2:
+        start, end = stored
+        if isinstance(start, date) and isinstance(end, date):
+            start, end = max(start, first), min(end, last)
+            if start <= end:
+                return start, end
+    return _default_range(first, last)
+
+
+def _period_picker(first: date, last: date) -> tuple[date, date]:
+    """Календарь с кнопками быстрого выбора. Возвращает границы интервала.
+
+    Кнопки обрабатываются раньше календаря: нажатие меняет интервал, который
+    календарь получает как значение по умолчанию в этом же перезапуске.
+    """
+    calendar_cell, quick_cell = st.columns([2, 2])
+
+    with quick_cell:
+        st.caption("Быстрый выбор")
+        buttons = st.columns(len(QUICK_RANGES))
+        for column, (label, days) in zip(buttons, QUICK_RANGES.items()):
+            if column.button(label, width="stretch", key=f"quick_{label}"):
+                start = (first if days is None
+                         else max(first, last - timedelta(days=days - 1)))
+                st.session_state[RANGE_KEY] = (start, last)
+
+    with calendar_cell:
+        chosen = st.date_input(
+            "Период", value=_remembered_range(first, last),
+            min_value=first, max_value=last, format="DD.MM.YYYY",
+            help=f"Данные есть с {first:%d.%m.%Y} по {last:%d.%m.%Y}.",
         )
-    with middle:
+
+    if not isinstance(chosen, (tuple, list)):
+        chosen = (chosen,)
+    if len(chosen) < 2:
+        # Первый клик в календаре: конец интервала ещё не выбран.
+        st.caption("Выберите вторую дату периода — пока показан один день.")
+        return chosen[0], chosen[0]
+
+    st.session_state[RANGE_KEY] = (chosen[0], chosen[1])
+    return chosen[0], chosen[1]
+
+
+def _filters(rows: pd.DataFrame) -> pd.DataFrame:
+    accounts = sorted(rows["account"].unique())
+    left, right = st.columns([2, 1.4])
+    with left:
         chosen_accounts = st.multiselect("Аккаунты", accounts, default=accounts)
     with right:
-        regions = sorted(listings["region"].dropna().unique())
-        chosen_regions = st.multiselect("Регионы", regions,
-                                        placeholder="Все регионы")
+        regions = sorted(rows["region"].dropna().unique())
+        chosen_regions = st.multiselect("Регионы", regions, placeholder="Все регионы")
 
-    selected = periods[periods["label"].isin(chosen_labels)]
-    mask = (
-        listings["period_start"].isin(selected["period_start"])
-        & listings["account"].isin(chosen_accounts)
-    )
+    mask = rows["account"].isin(chosen_accounts)
     if chosen_regions:
-        mask &= listings["region"].isin(chosen_regions)
-    return listings[mask].copy(), selected
-
-
-def _calls_for(listings: pd.DataFrame, calls: pd.DataFrame) -> pd.DataFrame:
-    """Звонки, попавшие в периоды и аккаунты отфильтрованной выборки."""
-    if listings.empty:
-        return pd.DataFrame(columns=["account_id", "period_start", "period_end",
-                                     "calls", "deals"])
-    periods = (listings[["account_id", "account", "period_start", "period_end"]]
-               .drop_duplicates())
-    per_period = metrics.calls_by_period(calls, periods.drop(columns="account"))
-    return per_period.merge(periods[["account_id", "account"]].drop_duplicates(),
-                            on="account_id", how="left")
+        mask &= rows["region"].isin(chosen_regions)
+    return rows[mask].copy()
 
 
 def _kpi_row(totals: dict, has_calls: bool) -> None:
     """Три ряда по четыре карточки: подписи не обрезаются даже на ноутбуке."""
     rows = [
         [("Расходы", fmt_money(totals["spend_total"])),
-         ("Объявлений", fmt_int(totals["listings"])),
+         ("Объявлений в день", fmt_int(totals["listings_per_day"])),
          ("Показы", fmt_int(totals["impressions"])),
          ("Просмотры", fmt_int(totals["views"]))],
         [("Контакты", fmt_int(totals["contacts"])),
@@ -121,17 +157,15 @@ def _format_table(df: pd.DataFrame, spec: list[tuple]) -> pd.DataFrame:
     return out
 
 
-def _account_comparison(listings: pd.DataFrame, calls_periods: pd.DataFrame) -> None:
+def _account_comparison(rows: pd.DataFrame, calls_accounts: pd.DataFrame) -> None:
     st.subheader("Сравнение аккаунтов")
-    agg = metrics.aggregate(listings, ["account"])
-    calls_by_account = (calls_periods.groupby("account", dropna=False)[["calls", "deals"]]
-                        .sum().reset_index()
-                        if not calls_periods.empty else pd.DataFrame())
-    if calls_by_account.empty:
+    agg = metrics.aggregate(rows, ["account"])
+    if calls_accounts.empty:
         agg["calls"] = 0
         agg["deals"] = 0
     else:
-        agg = agg.merge(calls_by_account, on="account", how="left")
+        agg = agg.merge(calls_accounts[["account", "calls", "deals"]],
+                        on="account", how="left")
         agg[["calls", "deals"]] = agg[["calls", "deals"]].fillna(0)
     agg = metrics.add_derived(agg).sort_values("contacts", ascending=False)
 
@@ -164,7 +198,8 @@ def _account_comparison(listings: pd.DataFrame, calls_periods: pd.DataFrame) -> 
             st.plotly_chart(figure, width="stretch")
 
     st.dataframe(_format_table(agg, [
-        ("account", "Аккаунт", None), ("listings", "Объявлений", fmt_int),
+        ("account", "Аккаунт", None), ("days", "Дней", fmt_int),
+        ("listings_per_day", "Объявлений в день", fmt_int),
         ("impressions", "Показы", fmt_int), ("views", "Просмотры", fmt_int),
         ("contacts", "Контакты", fmt_int), ("calls", "Звонки", fmt_int),
         ("spend_total", "Расходы", fmt_money),
@@ -177,45 +212,56 @@ def _account_comparison(listings: pd.DataFrame, calls_periods: pd.DataFrame) -> 
                    "Данные вносятся в разделе «Звонки».")
 
 
-def _dynamics(listings: pd.DataFrame, calls_periods: pd.DataFrame) -> None:
-    periods_count = listings[["period_start", "period_end"]].drop_duplicates().shape[0]
-    if periods_count < 2:
-        st.caption("Динамика появится, когда будет загружено больше одного периода.")
+def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame) -> None:
+    if rows["stat_date"].nunique() < 2:
+        st.caption("Динамика появится, когда в выбранном периоде будет больше "
+                   "одного дня с данными.")
         return
 
-    st.subheader("Динамика по периодам")
-    agg = metrics.aggregate(listings, ["period_start", "period_end", "account"])
-    if not calls_periods.empty:
-        agg = agg.merge(
-            calls_periods[["account", "period_start", "period_end", "calls"]],
-            on=["account", "period_start", "period_end"], how="left")
+    st.subheader("Динамика")
+    left, right = st.columns([2, 1.4])
+    with left:
+        choice = st.radio(
+            "Показатель",
+            ["Контакты", "Звонки", "Расходы, ₽", "Цена контакта, ₽"],
+            horizontal=True, label_visibility="collapsed",
+        )
+    with right:
+        grain = st.radio("Шаг", list(GRANULARITY), horizontal=True,
+                         label_visibility="collapsed")
+
+    freq = GRANULARITY[grain]
+    daily = rows.copy()
+    daily["bucket"] = metrics.bucket(daily["stat_date"], freq)
+    agg = metrics.aggregate(daily, ["bucket", "account"])
+
+    if not calls_days.empty:
+        by_bucket = calls_days.copy()
+        by_bucket["bucket"] = metrics.bucket(by_bucket["stat_date"], freq)
+        by_bucket = (by_bucket.groupby(["bucket", "account"], dropna=False)["calls"]
+                     .sum().reset_index())
+        agg = agg.merge(by_bucket, on=["bucket", "account"], how="left")
         agg["calls"] = agg["calls"].fillna(0)
     else:
         agg["calls"] = 0
-    agg = metrics.add_derived(agg)
-    agg["Период"] = [metrics.period_label(s, e)
-                     for s, e in zip(agg.period_start, agg.period_end)]
-    agg = agg.sort_values("period_start")
 
-    choice = st.radio(
-        "Показатель",
-        ["Контакты", "Звонки", "Расходы, ₽", "Цена контакта, ₽"],
-        horizontal=True, label_visibility="collapsed",
-    )
+    agg = metrics.add_derived(agg).sort_values("bucket")
     column = {v: k for k, v in metrics.RU_LABELS.items()}[choice]
-    figure = px.line(agg, x="Период", y=column, color="account", markers=True,
+    figure = px.line(agg, x="bucket", y=column, color="account", markers=True,
                      color_discrete_sequence=PALETTE,
-                     labels={column: choice, "account": "Аккаунт"})
-    figure.update_layout(height=340, margin={"l": 10, "r": 10, "t": 30, "b": 10})
+                     labels={column: choice, "account": "Аккаунт", "bucket": ""})
+    figure.update_layout(height=340, margin={"l": 10, "r": 10, "t": 30, "b": 10},
+                         hovermode="x unified")
+    figure.update_xaxes(tickformat="%d.%m.%Y" if freq != "M" else "%m.%Y")
     st.plotly_chart(figure, width="stretch")
 
 
-def _geography(listings: pd.DataFrame) -> None:
+def _geography(rows: pd.DataFrame) -> None:
     st.subheader("География")
     level = st.radio("Разрез", ["Регион", "Город"], horizontal=True,
                      label_visibility="collapsed")
     column = "region" if level == "Регион" else "city"
-    agg = metrics.add_derived(metrics.aggregate(listings, [column]))
+    agg = metrics.add_derived(metrics.aggregate(rows, [column]))
     agg = agg.sort_values("spend_total", ascending=False)
 
     # Длина столбца — потраченные деньги, цвет — сколько контактов они принесли.
@@ -228,7 +274,7 @@ def _geography(listings: pd.DataFrame) -> None:
         text=top["spend_total"].map(lambda v: fmt_money(v)),
         labels={"spend_total": "Расходы, ₽", column: "", "contacts": "Контакты"},
         title=f"Топ-15 по расходам · цвет — число контактов ({level.lower()})",
-        hover_data={"contacts": True, "views": True, "listings": True},
+        hover_data={"contacts": True, "views": True, "listings_per_day": ":.1f"},
     )
     figure.update_traces(textposition="outside", cliponaxis=False)
     figure.update_layout(height=480, margin={"l": 10, "r": 60, "t": 60, "b": 10})
@@ -246,7 +292,8 @@ def _geography(listings: pd.DataFrame) -> None:
 
     with st.expander(f"Таблица по всем ({len(agg)})"):
         st.dataframe(_format_table(agg.sort_values("spend_total", ascending=False), [
-            (column, level, None), ("listings", "Объявлений", fmt_int),
+            (column, level, None),
+            ("listings_per_day", "Объявлений в день", fmt_int),
             ("impressions", "Показы", fmt_int), ("views", "Просмотры", fmt_int),
             ("contacts", "Контакты", fmt_int),
             ("spend_total", "Расходы", fmt_money),
@@ -254,25 +301,53 @@ def _geography(listings: pd.DataFrame) -> None:
         ]), width="stretch", hide_index=True)
 
 
+def _account_comparison_summary(rows: pd.DataFrame) -> None:
+    """Доли расходов по аккаунтам рядом с воронкой."""
+    agg = metrics.aggregate(rows, ["account"])
+    figure = px.pie(agg, names="account", values="spend_total", hole=0.55,
+                    color_discrete_sequence=PALETTE, title="Распределение расходов")
+    figure.update_traces(textposition="inside", textinfo="percent+label")
+    figure.update_layout(height=320, showlegend=False,
+                         margin={"l": 10, "r": 10, "t": 30, "b": 10})
+    st.plotly_chart(figure, width="stretch")
+
+
 def dashboard_page(engine) -> None:
     version = data_version()
-    listings = cached_listings(engine, version)
-    calls = cached_calls(engine, version)
+    bounds = cached_bounds(engine, version)
 
     st.header("Дашборд")
-    if listings.empty:
-        st.info("Данных пока нет. Загрузите выгрузки Авито в разделе «Загрузка выгрузок».")
+    if bounds is None:
+        st.info("Данных пока нет. Загрузите дневные выгрузки Авито в разделе "
+                "«Загрузка выгрузок».")
         return
 
-    filtered, selected_periods = _filters(listings)
-    if filtered.empty or selected_periods.empty:
+    first, last = bounds
+    start, end = _period_picker(first, last)
+    rows = cached_daily(engine, version, start, end)
+    if rows.empty:
+        st.warning(f"За {metrics.range_label(start, end)} данных нет — "
+                   "выберите другой период.")
+        return
+
+    filtered = _filters(rows)
+    if filtered.empty:
         st.warning("По выбранным фильтрам данных нет.")
         return
 
-    calls_periods = _calls_for(filtered, calls)
-    calls_total = float(calls_periods["calls"].sum()) if not calls_periods.empty else 0.0
+    calls = cached_calls(engine, version)
+    accounts_in_view = set(filtered["account"].unique())
+    calls_accounts = metrics.calls_by_account(calls, start, end)
+    calls_accounts = calls_accounts[calls_accounts["account"].isin(accounts_in_view)]
+    calls_days = metrics.calls_by_day(calls, start, end)
+    calls_days = calls_days[calls_days["account"].isin(accounts_in_view)]
+
+    calls_total = float(calls_accounts["calls"].sum()) if not calls_accounts.empty else 0.0
     has_calls = calls_total > 0
     totals = metrics.funnel_totals(filtered, calls_total)
+
+    st.caption(f"{metrics.range_label(start, end)} · дней с данными: "
+               f"{fmt_int(totals['days'])} · строк: {fmt_int(totals['rows'])}")
 
     st.divider()
     _kpi_row(totals, has_calls)
@@ -282,27 +357,15 @@ def dashboard_page(engine) -> None:
     with left:
         _funnel(totals, has_calls)
     with right:
-        _account_comparison_summary(filtered, calls_periods)
+        _account_comparison_summary(filtered)
 
     st.divider()
-    _account_comparison(filtered, calls_periods)
+    _account_comparison(filtered, calls_accounts)
     st.divider()
-    _dynamics(filtered, calls_periods)
+    _dynamics(filtered, calls_days)
     st.divider()
     _geography(filtered)
 
     if st.button("Обновить данные"):
         bump_data_version()
         st.rerun()
-
-
-def _account_comparison_summary(listings: pd.DataFrame,
-                                calls_periods: pd.DataFrame) -> None:
-    """Доли расходов по аккаунтам рядом с воронкой."""
-    agg = metrics.aggregate(listings, ["account"])
-    figure = px.pie(agg, names="account", values="spend_total", hole=0.55,
-                    color_discrete_sequence=PALETTE, title="Распределение расходов")
-    figure.update_traces(textposition="inside", textinfo="percent+label")
-    figure.update_layout(height=320, showlegend=False,
-                         margin={"l": 10, "r": 10, "t": 30, "b": 10})
-    st.plotly_chart(figure, width="stretch")

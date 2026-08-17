@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import pandas as pd
 import streamlit as st
 
@@ -35,8 +37,18 @@ def fmt_pct(value, digits: int = 1) -> str:
 
 
 @st.cache_data(ttl=300, show_spinner="Читаю данные…")
-def cached_listings(_engine, version: int) -> pd.DataFrame:
-    return db.load_listings(_engine)
+def cached_daily(_engine, version: int, start: date, end: date) -> pd.DataFrame:
+    return db.load_daily(_engine, start, end)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_bounds(_engine, version: int) -> tuple[date, date] | None:
+    return db.date_bounds(_engine)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_days(_engine, version: int) -> pd.DataFrame:
+    return db.imported_days(_engine)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
