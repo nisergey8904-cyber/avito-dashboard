@@ -31,6 +31,11 @@ QUICK_RANGES = {"7 дней": 7, "30 дней": 30, "90 дней": 90, "Всё �
 
 GRANULARITY = {"По дням": "D", "По неделям": "W", "По месяцам": "M"}
 
+# В части строк выгрузки Авито не проставляет регион и город. Расходы по ним
+# настоящие, поэтому строки не выбрасываются, а сводятся в отдельную группу с
+# понятной подписью — вместо безымянного «NaN» на графике.
+NO_GEO = "Не указан"
+
 
 def _default_range(first: date, last: date) -> tuple[date, date]:
     return max(first, last - timedelta(days=29)), last
@@ -280,6 +285,17 @@ def _geography(rows: pd.DataFrame) -> None:
     figure.update_layout(height=480, margin={"l": 10, "r": 60, "t": 60, "b": 10})
     st.plotly_chart(figure, width="stretch")
 
+    unknown = agg[agg[column] == NO_GEO]
+    if not unknown.empty:
+        spent = float(unknown["spend_total"].iloc[0])
+        total = agg["spend_total"].sum()
+        st.caption(
+            f"«{NO_GEO}» — строки, в которых Авито не указал {level.lower()}: "
+            f"{fmt_int(unknown['rows'].iloc[0])} строк, {fmt_money(spent)} "
+            f"({fmt_pct(spent / total if total else 0)} расходов). "
+            "Это данные самой выгрузки, а не потеря при загрузке."
+        )
+
     dead = agg[(agg["contacts"] == 0) & (agg["spend_total"] > 0)]
     if not dead.empty:
         wasted = dead["spend_total"].sum()
@@ -329,6 +345,7 @@ def dashboard_page(engine) -> None:
         st.warning(f"За {metrics.range_label(start, end)} данных нет — "
                    "выберите другой период.")
         return
+    rows[["region", "city"]] = rows[["region", "city"]].fillna(NO_GEO)
 
     filtered = _filters(rows)
     if filtered.empty:

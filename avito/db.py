@@ -12,6 +12,7 @@ Streamlit Community Cloud эфемерна, поэтому при деплое �
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -221,9 +222,30 @@ def _migrate(engine: Engine) -> None:
         statements.append(
             f"ALTER TABLE accounts ADD COLUMN {exists_clause}avito_id VARCHAR(40)")
 
+    statements += _nan_cleanup(engine, present)
+
     for statement in statements:
         with engine.begin() as conn:
             conn.execute(text(statement))
+
+
+def _nan_cleanup(engine: Engine, present: set[str]) -> list[str]:
+    """Чинит строки, записанные до появления _clean().
+
+    Тогда пустые регион и город попадали в Postgres текстом «NaN», и на
+    дашборде это выглядело как город с таким названием. Проверка дешёвая и
+    после первой починки ничего не находит, так что остаётся безвредной.
+    """
+    if "daily_stats" not in present:
+        return []
+    with engine.connect() as conn:
+        broken = conn.execute(text(
+            "SELECT 1 FROM daily_stats WHERE region = 'NaN' OR city = 'NaN' LIMIT 1"
+        )).first()
+    if not broken:
+        return []
+    return [f"UPDATE daily_stats SET {column} = NULL WHERE {column} = 'NaN'"
+            for column in ("region", "city")]
 
 
 # --- аккаунты ---------------------------------------------------------------
@@ -304,13 +326,28 @@ def account_for_avito_id(engine: Engine, avito_id: str) -> int:
 
 # --- дневные данные ---------------------------------------------------------
 
+def _clean(value):
+    """Пустое значение pandas -> NULL.
+
+    Обязательно делать это до вставки: в текстовой колонке Postgres сохраняет
+    float('nan') строкой «NaN», и в данных заводятся города с таким именем.
+    SQLite такую вставку молча превращает в NULL, поэтому локально расхождение
+    не видно — ошибка проявляется только в облаке.
+    """
+    if value is None or value is pd.NaT:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
 def save_day(engine: Engine, account_id: int, stat_date: date, filename: str,
              rows: pd.DataFrame) -> tuple[int, bool]:
     """Записывает строки за один день. Повторная загрузка заменяет прежние.
 
     Возвращает (сколько строк записано, были ли данные за этот день раньше).
     """
-    payload = [{f: record.get(f) for f in ROW_FIELDS}
+    payload = [{f: _clean(record.get(f)) for f in ROW_FIELDS}
                for record in rows.to_dict("records")]
     imported_at = datetime.now(timezone.utc)
 
