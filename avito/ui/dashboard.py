@@ -303,29 +303,124 @@ def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame,
                    "чтобы увидеть, что меняли и почему.")
 
 
+GEO_METRICS = ["Расходы", "Контакты", "Конверсия"]
+
+# Конверсия по городу с десятком просмотров — шум: 1 контакт из 3 просмотров
+# даёт 33 % и выталкивает наверх случайные точки. Медиана по городам за месяц —
+# около 10 просмотров, по регионам — около 150, отсюда порог по умолчанию.
+GEO_MIN_VIEWS = 50
+
+
+# Подсказка одна для всех режимов: значения форматируются заранее, чтобы пустая
+# цена контакта печаталась прочерком, а не «NaN».
+GEO_HOVER = [("Расходы", "spend_total", fmt_money),
+             ("Просмотры", "views", fmt_int),
+             ("Контакты", "contacts", fmt_int),
+             ("Просмотр → контакт", "cr_views_contacts", fmt_pct),
+             ("Цена контакта", "cost_per_contact", fmt_money)]
+
+
+def _geo_hover(top: pd.DataFrame) -> dict:
+    lines = "".join(f"<br>{label}: %{{customdata[{i}]}}"
+                    for i, (label, _, _) in enumerate(GEO_HOVER))
+    return {
+        "customdata": [[fmt(row[col]) for _, col, fmt in GEO_HOVER]
+                       for _, row in top.iterrows()],
+        "hovertemplate": "<b>%{y}</b>" + lines + "<extra></extra>",
+    }
+
+
+def _geo_chart(agg: pd.DataFrame, column: str, level: str, metric: str,
+               min_views: int) -> None:
+    """Топ-15 по выбранному показателю, горизонтальные столбцы."""
+    where = level.lower()
+    if metric == "Расходы":
+        # Длина столбца — потраченные деньги, цвет — сколько контактов они
+        # принесли. Две оси на одном графике здесь только путали: контакты
+        # измеряются единицами, а расходы — тысячами.
+        top = agg.nlargest(15, "spend_total").sort_values("spend_total")
+        figure = px.bar(
+            top, x="spend_total", y=column, orientation="h",
+            color="contacts",
+            color_continuous_scale=["#5A6478", "#F2A93B", "#00A87E"],
+            text=top["spend_total"].map(lambda v: fmt_money(v)),
+            labels={"spend_total": "Расходы, ₽", column: "", "contacts": "Контакты"},
+            title=f"Топ-15 по расходам · цвет — число контактов ({where})",
+        )
+    elif metric == "Контакты":
+        # Цвет — цена контакта: среди лидеров по контактам сразу видно, какие
+        # достались дорого.
+        top = agg.nlargest(15, "contacts").sort_values("contacts")
+        figure = px.bar(
+            top, x="contacts", y=column, orientation="h",
+            color="cost_per_contact",
+            color_continuous_scale=["#00A87E", "#F2A93B", "#D9534F"],
+            text=top["contacts"].map(fmt_int),
+            labels={"contacts": "Контакты", column: "",
+                    "cost_per_contact": "Цена контакта, ₽"},
+            title=f"Топ-15 по контактам · цвет — цена контакта ({where})",
+        )
+    else:
+        eligible = agg[agg["views"] >= min_views].dropna(subset=["cr_views_contacts"])
+        if eligible.empty:
+            st.info(f"Нет ни одного места ({where}) с {fmt_int(min_views)}+ "
+                    "просмотрами — уменьшите порог.")
+            return
+        top = (eligible.nlargest(15, "cr_views_contacts")
+               .sort_values("cr_views_contacts"))
+        figure = px.bar(
+            top, x="cr_views_contacts", y=column, orientation="h",
+            color="contacts",
+            color_continuous_scale=["#5A6478", "#F2A93B", "#00A87E"],
+            text=top["cr_views_contacts"].map(fmt_pct),
+            labels={"cr_views_contacts": "Просмотр → контакт", column: "",
+                    "contacts": "Контакты"},
+            title=(f"Топ-15 по конверсии просмотр → контакт · от "
+                   f"{fmt_int(min_views)} просмотров · цвет — контакты ({where})"),
+        )
+        figure.update_xaxes(tickformat=".0%")
+        views, contacts = agg["views"].sum(), agg["contacts"].sum()
+        if views:
+            average = contacts / views
+            figure.add_vline(x=average, line_dash="dash", line_color="#5A6478",
+                             annotation_text=f"в среднем {fmt_pct(average)}",
+                             annotation_position="top")
+
+    figure.update_traces(textposition="outside", cliponaxis=False,
+                         **_geo_hover(top))
+    figure.update_layout(height=480, margin={"l": 10, "r": 60, "t": 60, "b": 10},
+                         separators=", ")
+    st.plotly_chart(figure, width="stretch")
+    if metric == "Конверсия":
+        st.caption(f"В график попали {len(eligible)} из {len(agg)} — у остальных "
+                   f"меньше {fmt_int(min_views)} просмотров, их конверсия случайна. "
+                   "Пунктир — средняя конверсия по всем выбранным данным.")
+
+
 def _geography(rows: pd.DataFrame) -> None:
     st.subheader("География")
-    level = st.radio("Разрез", ["Регион", "Город"], horizontal=True,
-                     label_visibility="collapsed")
+    level_cell, metric_cell, threshold_cell = st.columns(
+        [1, 1.6, 1], vertical_alignment="bottom")
+    with level_cell:
+        level = st.radio("Разрез", ["Регион", "Город"], horizontal=True,
+                         label_visibility="collapsed")
+    with metric_cell:
+        metric = st.radio("Показатель на графике", GEO_METRICS, horizontal=True,
+                          label_visibility="collapsed", key="geo_metric")
+    min_views = GEO_MIN_VIEWS
+    if metric == "Конверсия":
+        with threshold_cell:
+            min_views = int(st.number_input(
+                "Минимум просмотров", min_value=0, value=GEO_MIN_VIEWS, step=10,
+                key="geo_min_views",
+                help="Места с меньшим числом просмотров в график конверсии "
+                     "не попадают: на малых числах процент случаен.",
+            ))
     column = "region" if level == "Регион" else "city"
     agg = metrics.add_derived(metrics.aggregate(rows, [column]))
     agg = agg.sort_values("spend_total", ascending=False)
 
-    # Длина столбца — потраченные деньги, цвет — сколько контактов они принесли.
-    # Две оси на одном графике здесь только путали: контакты измеряются единицами,
-    # а расходы — тысячами.
-    top = agg.head(15).sort_values("spend_total")
-    figure = px.bar(
-        top, x="spend_total", y=column, orientation="h",
-        color="contacts", color_continuous_scale=["#5A6478", "#F2A93B", "#00A87E"],
-        text=top["spend_total"].map(lambda v: fmt_money(v)),
-        labels={"spend_total": "Расходы, ₽", column: "", "contacts": "Контакты"},
-        title=f"Топ-15 по расходам · цвет — число контактов ({level.lower()})",
-        hover_data={"contacts": True, "views": True, "listings_per_day": ":.1f"},
-    )
-    figure.update_traces(textposition="outside", cliponaxis=False)
-    figure.update_layout(height=480, margin={"l": 10, "r": 60, "t": 60, "b": 10})
-    st.plotly_chart(figure, width="stretch")
+    _geo_chart(agg, column, level, metric, min_views)
 
     unknown = agg[agg[column] == NO_GEO]
     if not unknown.empty:
@@ -354,6 +449,7 @@ def _geography(rows: pd.DataFrame) -> None:
             ("listings_per_day", "Объявлений в день", fmt_int),
             ("impressions", "Показы", fmt_int), ("views", "Просмотры", fmt_int),
             ("contacts", "Контакты", fmt_int),
+            ("cr_views_contacts", "Просмотр → контакт", fmt_pct),
             ("spend_total", "Расходы", fmt_money),
             ("cost_per_contact", "Цена контакта", fmt_money),
         ]), width="stretch", hide_index=True)
