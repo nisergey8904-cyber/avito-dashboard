@@ -14,16 +14,24 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from avito import metrics
+from avito.ui.avitolog import (
+    add_batch_marks, add_short_day_marks, chats_block, inventory_block,
+    kassa_block, plan_fact_block,
+)
 from avito.ui.common import (
-    DASH, bump_data_version, cached_bounds, cached_calls, cached_daily,
+    DASH, PALETTE, bump_data_version, cached_bounds, cached_calls,
+    cached_contract, cached_contract_bounds, cached_daily, cached_plan,
     data_version, fmt_int, fmt_money, fmt_pct,
 )
 
-PALETTE = ["#2E6FD9", "#00A87E", "#F2A93B", "#D9534F", "#7B5AA6", "#4BB3C4"]
+# Календарь живёт под постоянным ключом виджета. Без ключа Streamlit узнаёт
+# виджет по параметрам, и смена value после каждого выбора пересоздавала
+# календарь — первый клик нового выделения терялся. Кнопки быстрого выбора
+# меняют значение через on_click: колбэк выполняется до отрисовки виджета.
+PICKER_KEY = "dashboard_period"
 
-# Выбранный интервал хранится в обычном ключе сессии, а не в ключе виджета:
-# значение виджета Streamlit запрещает менять из кода после первой отрисовки,
-# а кнопкам быстрого выбора это нужно на каждом перезапуске.
+# Копия последнего полного интервала. Ключ виджета Streamlit удаляет, когда
+# страница не отрисована, а эта копия переживает переход между страницами.
 RANGE_KEY = "dashboard_range"
 
 # Быстрый выбор: подпись -> сколько последних дней истории брать (None — всю).
@@ -43,42 +51,58 @@ def _default_range(first: date, last: date) -> tuple[date, date]:
     return max(first, last - timedelta(days=29)), last
 
 
-def _remembered_range(first: date, last: date) -> tuple[date, date]:
-    """Прошлый выбор, подрезанный под доступные даты.
+def _clamped(value, first: date, last: date) -> tuple[date, ...] | None:
+    """Интервал из сессии, подрезанный под доступные даты, или None.
 
     Новые данные сдвигают границы календаря, а в сессии может лежать интервал
-    за их пределами — date_input на таком значении падает.
+    за их пределами — date_input на таком значении падает. Недовыбранный
+    интервал из одной даты сохраняется как есть, чтобы не сбросить выделение.
     """
-    stored = st.session_state.get(RANGE_KEY)
-    if isinstance(stored, (tuple, list)) and len(stored) == 2:
-        start, end = stored
-        if isinstance(start, date) and isinstance(end, date):
-            start, end = max(start, first), min(end, last)
-            if start <= end:
-                return start, end
-    return _default_range(first, last)
+    if isinstance(value, date):
+        value = (value,)
+    if not isinstance(value, (tuple, list)) or not 1 <= len(value) <= 2:
+        return None
+    if not all(isinstance(day, date) for day in value):
+        return None
+    clamped = tuple(min(max(day, first), last) for day in value)
+    if len(clamped) == 2 and clamped[0] > clamped[1]:
+        return None
+    return clamped
+
+
+def _prepare_picker(first: date, last: date) -> None:
+    """Готовит значение календаря до его отрисовки в этом перезапуске."""
+    current = st.session_state.get(PICKER_KEY)
+    fixed = _clamped(current, first, last)
+    if fixed is None:
+        fixed = (_clamped(st.session_state.get(RANGE_KEY), first, last)
+                 or _default_range(first, last))
+    if fixed != (tuple(current) if isinstance(current, (tuple, list)) else current):
+        st.session_state[PICKER_KEY] = fixed
+
+
+def _apply_quick(start: date, end: date) -> None:
+    st.session_state[PICKER_KEY] = (start, end)
+    st.session_state[RANGE_KEY] = (start, end)
 
 
 def _period_picker(first: date, last: date) -> tuple[date, date]:
-    """Календарь с кнопками быстрого выбора. Возвращает границы интервала.
-
-    Кнопки обрабатываются раньше календаря: нажатие меняет интервал, который
-    календарь получает как значение по умолчанию в этом же перезапуске.
-    """
+    """Календарь с кнопками быстрого выбора. Возвращает границы интервала."""
+    _prepare_picker(first, last)
     calendar_cell, quick_cell = st.columns([2, 2])
 
     with quick_cell:
         st.caption("Быстрый выбор")
         buttons = st.columns(len(QUICK_RANGES))
         for column, (label, days) in zip(buttons, QUICK_RANGES.items()):
-            if column.button(label, width="stretch", key=f"quick_{label}"):
-                start = (first if days is None
-                         else max(first, last - timedelta(days=days - 1)))
-                st.session_state[RANGE_KEY] = (start, last)
+            start = (first if days is None
+                     else max(first, last - timedelta(days=days - 1)))
+            column.button(label, width="stretch", key=f"quick_{label}",
+                          on_click=_apply_quick, args=(start, last))
 
     with calendar_cell:
         chosen = st.date_input(
-            "Период", value=_remembered_range(first, last),
+            "Период", key=PICKER_KEY,
             min_value=first, max_value=last, format="DD.MM.YYYY",
             help=f"Данные есть с {first:%d.%m.%Y} по {last:%d.%m.%Y}.",
         )
@@ -94,19 +118,28 @@ def _period_picker(first: date, last: date) -> tuple[date, date]:
     return chosen[0], chosen[1]
 
 
-def _filters(rows: pd.DataFrame) -> pd.DataFrame:
-    accounts = sorted(rows["account"].unique())
+def _filters(rows: pd.DataFrame, extra_accounts: set[str]) -> tuple[list[str], list[str]]:
+    """Выбранные аккаунты и регионы.
+
+    Аккаунты — из выгрузок и из таблиц AI Avitolog: касса может прийти за
+    день, выгрузки за который ещё нет. Регион есть только в выгрузках.
+    """
+    accounts = sorted(set(rows["account"].unique() if not rows.empty else [])
+                      | extra_accounts)
     left, right = st.columns([2, 1.4])
     with left:
         chosen_accounts = st.multiselect("Аккаунты", accounts, default=accounts)
     with right:
-        regions = sorted(rows["region"].dropna().unique())
+        regions = sorted(rows["region"].dropna().unique()) if not rows.empty else []
         chosen_regions = st.multiselect("Регионы", regions, placeholder="Все регионы")
+    return chosen_accounts, chosen_regions
 
-    mask = rows["account"].isin(chosen_accounts)
-    if chosen_regions:
-        mask &= rows["region"].isin(chosen_regions)
-    return rows[mask].copy()
+
+def _merge_bounds(*bounds) -> tuple[date, date] | None:
+    found = [b for b in bounds if b is not None]
+    if not found:
+        return None
+    return min(b[0] for b in found), max(b[1] for b in found)
 
 
 def _kpi_row(totals: dict, has_calls: bool) -> None:
@@ -219,7 +252,8 @@ def _account_comparison(rows: pd.DataFrame, calls_accounts: pd.DataFrame) -> Non
                    "Данные вносятся в разделе «Звонки».")
 
 
-def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame) -> None:
+def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame,
+              batches: pd.DataFrame, kassa: pd.DataFrame) -> None:
     if rows["stat_date"].nunique() < 2:
         st.caption("Динамика появится, когда в выбранном периоде будет больше "
                    "одного дня с данными.")
@@ -257,10 +291,16 @@ def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame) -> None:
     figure = px.line(agg, x="bucket", y=column, color="account", markers=True,
                      color_discrete_sequence=PALETTE,
                      labels={column: choice, "account": "Аккаунт", "bucket": ""})
+    if freq == "D":
+        add_short_day_marks(figure, agg, column, kassa)
+    add_batch_marks(figure, batches)
     figure.update_layout(height=340, margin={"l": 10, "r": 10, "t": 30, "b": 10},
                          hovermode="x unified")
     figure.update_xaxes(tickformat="%d.%m.%Y" if freq != "M" else "%m.%Y")
     st.plotly_chart(figure, width="stretch")
+    if not batches.empty:
+        st.caption("◆ и пунктир — партии изменений ставок: наведите на ромб, "
+                   "чтобы увидеть, что меняли и почему.")
 
 
 def _geography(rows: pd.DataFrame) -> None:
@@ -332,9 +372,14 @@ def _account_comparison_summary(rows: pd.DataFrame) -> None:
 
 def dashboard_page(engine) -> None:
     version = data_version()
-    bounds = cached_bounds(engine, version)
 
     st.header("Дашборд")
+    # План/факт живёт в своём окне дат и от календаря периода не зависит.
+    plan_fact_block(cached_plan(engine, version))
+    st.divider()
+
+    bounds = _merge_bounds(cached_bounds(engine, version),
+                           cached_contract_bounds(engine, version))
     if bounds is None:
         st.info("Данных пока нет. Загрузите дневные выгрузки Авито в разделе "
                 "«Загрузка выгрузок».")
@@ -343,24 +388,76 @@ def dashboard_page(engine) -> None:
     first, last = bounds
     start, end = _period_picker(first, last)
     rows = cached_daily(engine, version, start, end)
-    if rows.empty:
+    contract = cached_contract(engine, version, start, end)
+    contract_accounts = {account for frame in contract.values() if not frame.empty
+                         for account in frame["account"].unique()}
+    if rows.empty and not contract_accounts:
         st.warning(f"За {metrics.range_label(start, end)} данных нет — "
                    "выберите другой период.")
         return
-    rows[["region", "city"]] = rows[["region", "city"]].fillna(NO_GEO)
+    if not rows.empty:
+        rows[["region", "city"]] = rows[["region", "city"]].fillna(NO_GEO)
 
-    filtered = _filters(rows)
+    chosen_accounts, chosen_regions = _filters(rows, contract_accounts)
+    contract = {name: frame[frame["account"].isin(chosen_accounts)]
+                if not frame.empty else frame
+                for name, frame in contract.items()}
+    filtered = rows
+    if not rows.empty:
+        mask = rows["account"].isin(chosen_accounts)
+        if chosen_regions:
+            mask &= rows["region"].isin(chosen_regions)
+        filtered = rows[mask].copy()
+    if chosen_regions:
+        st.caption("Фильтр по регионам действует только на блоки по выгрузкам: "
+                   "в кассе, чатах и инвентаре региона нет.")
+
     if filtered.empty:
-        st.warning("По выбранным фильтрам данных нет.")
-        return
+        st.warning("Выгрузок статистики объявлений по выбранным фильтрам нет — "
+                   "ниже только данные AI Avitolog.")
+    else:
+        calls_accounts, calls_days = _calls_in_view(engine, version, filtered, start, end)
+        _listing_overview(filtered, calls_accounts, start, end)
 
+    st.divider()
+    kassa_block(contract["kassa"])
+    st.divider()
+    chats_block(contract["chats"], contract["kassa"])
+
+    if not filtered.empty:
+        st.divider()
+        _account_comparison(filtered, calls_accounts)
+        st.divider()
+        _dynamics(filtered, calls_days,
+                  contract["batches"], contract["kassa"])
+
+    st.divider()
+    inventory_block(contract["inventory"])
+
+    if not filtered.empty:
+        st.divider()
+        _geography(filtered)
+
+    if st.button("Обновить данные"):
+        bump_data_version()
+        st.rerun()
+
+
+def _calls_in_view(engine, version: int, filtered: pd.DataFrame,
+                   start: date, end: date) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Звонки за период по аккаунтам и по дням — только для видимых аккаунтов."""
     calls = cached_calls(engine, version)
     accounts_in_view = set(filtered["account"].unique())
     calls_accounts = metrics.calls_by_account(calls, start, end)
     calls_accounts = calls_accounts[calls_accounts["account"].isin(accounts_in_view)]
     calls_days = metrics.calls_by_day(calls, start, end)
     calls_days = calls_days[calls_days["account"].isin(accounts_in_view)]
+    return calls_accounts, calls_days
 
+
+def _listing_overview(filtered: pd.DataFrame, calls_accounts: pd.DataFrame,
+                      start: date, end: date) -> None:
+    """Карточки, воронка и доли расходов по выгрузкам."""
     calls_total = float(calls_accounts["calls"].sum()) if not calls_accounts.empty else 0.0
     has_calls = calls_total > 0
     totals = metrics.funnel_totals(filtered, calls_total)
@@ -377,14 +474,3 @@ def dashboard_page(engine) -> None:
         _funnel(totals, has_calls)
     with right:
         _account_comparison_summary(filtered)
-
-    st.divider()
-    _account_comparison(filtered, calls_accounts)
-    st.divider()
-    _dynamics(filtered, calls_days)
-    st.divider()
-    _geography(filtered)
-
-    if st.button("Обновить данные"):
-        bump_data_version()
-        st.rerun()

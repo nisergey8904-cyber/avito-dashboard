@@ -93,6 +93,104 @@ calls = Table(
     UniqueConstraint("account_id", "call_date", name="uq_calls_day"),
 )
 
+# --- таблицы AI Avitolog (CONTRACT.md) --------------------------------------
+# Пишет их проект AI Avitolog — upsert'ом по первичному ключу, каждое утро.
+# Здесь они только читаются. Кабинет — avito_id строкой, без внешнего ключа на
+# accounts: писатель не знает внутренних номеров. Деньги в рублях, даты — МСК,
+# loaded_at — UTC. Схема меняется только после правки CONTRACT.md.
+
+kassa_daily = Table(
+    "kassa_daily", metadata,
+    Column("stat_date", Date, primary_key=True),
+    Column("avito_id", String(40), primary_key=True),
+    Column("deposits_rub", Float, nullable=False),
+    Column("deposits_count", Integer, nullable=False),
+    Column("deposits_detail", String(255), nullable=False),
+    Column("spend_rub", Float, nullable=False),
+    Column("left_rub", Float, nullable=False),
+    Column("last_chat_hour", Integer),
+    Column("verdict_code", String(16), nullable=False),
+    Column("verdict", String(160), nullable=False),
+    Column("full_day", Integer, nullable=False),
+    Column("balance_rub", Float),
+    Column("note", String(255)),
+    Column("loaded_at", DateTime, nullable=False),
+)
+
+chats_daily = Table(
+    "chats_daily", metadata,
+    Column("stat_date", Date, primary_key=True),
+    Column("avito_id", String(40), primary_key=True),
+    Column("chats", Integer, nullable=False),
+    Column("chats_evening", Integer, nullable=False),
+    Column("chats_night", Integer, nullable=False),
+    Column("chats_silent", Integer),
+    Column("chats_phone_left", Integer),
+    Column("loaded_at", DateTime, nullable=False),
+)
+
+inventory_daily = Table(
+    "inventory_daily", metadata,
+    Column("snap_date", Date, primary_key=True),
+    Column("avito_id", String(40), primary_key=True),
+    Column("active", Integer, nullable=False),
+    Column("on_bid", Integer, nullable=False),
+    Column("new_1d", Integer, nullable=False),
+    Column("expiring_7d", Integer, nullable=False),
+    Column("price_main", Float),
+    Column("cl_start", Integer, nullable=False),
+    Column("cl_core", Integer, nullable=False),
+    Column("cl_core_expensive", Integer, nullable=False),
+    Column("cl_single", Integer, nullable=False),
+    Column("cl_empty", Integer, nullable=False),
+    Column("cl_untested", Integer, nullable=False),
+    Column("spend_28d_rub", Float, nullable=False),
+    Column("spend_28d_no_contact_rub", Float, nullable=False),
+    Column("loaded_at", DateTime, nullable=False),
+)
+
+bid_batches = Table(
+    "bid_batches", metadata,
+    Column("batch", String(80), primary_key=True),
+    Column("avito_id", String(40), primary_key=True),
+    Column("batch_date", Date, primary_key=True),
+    Column("batch_time", String(5)),
+    Column("cards", Integer, nullable=False),
+    Column("n_on", Integer, nullable=False),
+    Column("n_up", Integer, nullable=False),
+    Column("n_down", Integer, nullable=False),
+    Column("n_off", Integer, nullable=False),
+    Column("n_limit", Integer, nullable=False),
+    Column("reason", String(500), nullable=False),
+    Column("loaded_at", DateTime, nullable=False),
+)
+
+plan_windows = Table(
+    "plan_windows", metadata,
+    Column("window_id", String(40), primary_key=True),
+    Column("title", String(120), nullable=False),
+    Column("date_from", Date, nullable=False),
+    Column("date_to", Date, nullable=False),
+    Column("target_chats", Integer, nullable=False),
+    Column("cpl_cap_rub", Float, nullable=False),
+    Column("avito_ids", String(255), nullable=False),
+    Column("forecast_chats", Integer),
+    Column("forecast_note", String(255)),
+    Column("is_current", Integer, nullable=False),
+    Column("loaded_at", DateTime, nullable=False),
+)
+
+plan_daily = Table(
+    "plan_daily", metadata,
+    Column("window_id", String(40), primary_key=True),
+    Column("stat_date", Date, primary_key=True),
+    Column("plan_chats_cum", Float, nullable=False),
+    Column("loaded_at", DateTime, nullable=False),
+)
+
+CONTRACT_TABLES = (kassa_daily, chats_daily, inventory_daily, bid_batches,
+                   plan_windows, plan_daily)
+
 # Поля строки объявления — всё, кроме служебных колонок дня.
 ROW_FIELDS = [c.name for c in daily_stats.columns
               if c.name not in ("id", "account_id", "stat_date", "source_file",
@@ -486,3 +584,96 @@ def load_calls(engine: Engine) -> pd.DataFrame:
     if not df.empty:
         df["call_date"] = pd.to_datetime(df["call_date"])
     return df
+
+
+# --- данные AI Avitolog: только чтение --------------------------------------
+
+def _account_names(conn) -> dict[str, str]:
+    rows = conn.execute(select(accounts.c.avito_id, accounts.c.name)
+                        .where(accounts.c.avito_id.is_not(None))).all()
+    return {str(avito_id): name for avito_id, name in rows}
+
+
+def account_label(names: dict[str, str], avito_id) -> str:
+    """Имя кабинета для показа; незнакомый кабинет подписывается его ID."""
+    return names.get(str(avito_id), f"Кабинет {avito_id}")
+
+
+def _read_contract(engine: Engine, table: Table, date_column: str,
+                   start: date | None, end: date | None,
+                   avito_ids: list[str] | None = None) -> pd.DataFrame:
+    """Строки таблицы контракта за интервал с колонкой account — именем кабинета."""
+    column = table.c[date_column]
+    query = select(table).order_by(column)
+    if start is not None:
+        query = query.where(column >= start)
+    if end is not None:
+        query = query.where(column <= end)
+    if avito_ids is not None:
+        query = query.where(table.c.avito_id.in_(avito_ids))
+    with engine.connect() as conn:
+        df = pd.DataFrame(conn.execute(query).mappings().all())
+        names = _account_names(conn)
+    if df.empty:
+        return pd.DataFrame(columns=[c.name for c in table.columns] + ["account"])
+    df[date_column] = pd.to_datetime(df[date_column])
+    df["loaded_at"] = pd.to_datetime(df["loaded_at"])
+    df["avito_id"] = df["avito_id"].astype(str)
+    df["account"] = df["avito_id"].map(lambda v: account_label(names, v))
+    return df
+
+
+def load_kassa(engine: Engine, start: date | None = None, end: date | None = None,
+               avito_ids: list[str] | None = None) -> pd.DataFrame:
+    return _read_contract(engine, kassa_daily, "stat_date", start, end, avito_ids)
+
+
+def load_chats(engine: Engine, start: date | None = None, end: date | None = None,
+               avito_ids: list[str] | None = None) -> pd.DataFrame:
+    return _read_contract(engine, chats_daily, "stat_date", start, end, avito_ids)
+
+
+def load_inventory(engine: Engine, start: date | None = None,
+                   end: date | None = None) -> pd.DataFrame:
+    return _read_contract(engine, inventory_daily, "snap_date", start, end)
+
+
+def load_bid_batches(engine: Engine, start: date | None = None,
+                     end: date | None = None) -> pd.DataFrame:
+    return _read_contract(engine, bid_batches, "batch_date", start, end)
+
+
+def load_plan(engine: Engine) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Окна, отмеченные для главного экрана, и их плановые кривые."""
+    with engine.connect() as conn:
+        windows = pd.DataFrame(conn.execute(
+            select(plan_windows).where(plan_windows.c.is_current == 1)
+            .order_by(plan_windows.c.date_from)
+        ).mappings().all())
+        if windows.empty:
+            return windows, pd.DataFrame()
+        curve = pd.DataFrame(conn.execute(
+            select(plan_daily)
+            .where(plan_daily.c.window_id.in_(windows["window_id"].tolist()))
+            .order_by(plan_daily.c.stat_date)
+        ).mappings().all())
+    for column in ("date_from", "date_to"):
+        windows[column] = windows[column].map(_as_date)
+    windows["loaded_at"] = pd.to_datetime(windows["loaded_at"])
+    if not curve.empty:
+        curve["stat_date"] = pd.to_datetime(curve["stat_date"])
+    return windows, curve
+
+
+def contract_bounds(engine: Engine) -> tuple[date, date] | None:
+    """Первый и последний день в дневных таблицах AI Avitolog."""
+    found = []
+    with engine.connect() as conn:
+        for table, column in ((kassa_daily, "stat_date"), (chats_daily, "stat_date"),
+                              (inventory_daily, "snap_date")):
+            found.append(conn.execute(select(func.min(table.c[column]),
+                                             func.max(table.c[column]))).one())
+    days = [_as_date(v) for row in found for v in row if v is not None]
+    if not days:
+        return None
+    return min(days), max(days)
