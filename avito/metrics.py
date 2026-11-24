@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 
 SUM_COLUMNS = [
-    "impressions", "views", "target_views", "contacts", "chat", "phone",
-    "phone_and_chat", "favorites", "spend_total", "spend_placement",
+    "impressions", "views", "target_views", "contacts", "phone",
+    "favorites", "spend_total", "spend_placement",
     "spend_promo", "bonus_spent",
 ]
 

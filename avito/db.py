@@ -628,11 +628,6 @@ def load_kassa(engine: Engine, start: date | None = None, end: date | None = Non
     return _read_contract(engine, kassa_daily, "stat_date", start, end, avito_ids)
 
 
-def load_chats(engine: Engine, start: date | None = None, end: date | None = None,
-               avito_ids: list[str] | None = None) -> pd.DataFrame:
-    return _read_contract(engine, chats_daily, "stat_date", start, end, avito_ids)
-
-
 def load_inventory(engine: Engine, start: date | None = None,
                    end: date | None = None) -> pd.DataFrame:
     return _read_contract(engine, inventory_daily, "snap_date", start, end)
@@ -643,34 +638,11 @@ def load_bid_batches(engine: Engine, start: date | None = None,
     return _read_contract(engine, bid_batches, "batch_date", start, end)
 
 
-def load_plan(engine: Engine) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Окна, отмеченные для главного экрана, и их плановые кривые."""
-    with engine.connect() as conn:
-        windows = pd.DataFrame(conn.execute(
-            select(plan_windows).where(plan_windows.c.is_current == 1)
-            .order_by(plan_windows.c.date_from)
-        ).mappings().all())
-        if windows.empty:
-            return windows, pd.DataFrame()
-        curve = pd.DataFrame(conn.execute(
-            select(plan_daily)
-            .where(plan_daily.c.window_id.in_(windows["window_id"].tolist()))
-            .order_by(plan_daily.c.stat_date)
-        ).mappings().all())
-    for column in ("date_from", "date_to"):
-        windows[column] = windows[column].map(_as_date)
-    windows["loaded_at"] = pd.to_datetime(windows["loaded_at"])
-    if not curve.empty:
-        curve["stat_date"] = pd.to_datetime(curve["stat_date"])
-    return windows, curve
-
-
 def contract_bounds(engine: Engine) -> tuple[date, date] | None:
     """Первый и последний день в дневных таблицах AI Avitolog."""
     found = []
     with engine.connect() as conn:
-        for table, column in ((kassa_daily, "stat_date"), (chats_daily, "stat_date"),
-                              (inventory_daily, "snap_date")):
+        for table, column in ((kassa_daily, "stat_date"), (inventory_daily, "snap_date")):
             found.append(conn.execute(select(func.min(table.c[column]),
                                              func.max(table.c[column]))).one())
     days = [_as_date(v) for row in found for v in row if v is not None]

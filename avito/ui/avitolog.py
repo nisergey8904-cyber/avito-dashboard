@@ -1,6 +1,7 @@
-"""Блоки по данным AI Avitolog: план/факт, касса, чаты, инвентарь, партии ставок.
+"""Блоки по данным AI Avitolog: касса, инвентарь, партии ставок.
 
 Строки пишет проект AI Avitolog (см. CONTRACT.md), здесь они только рисуются.
+Чаты и план в чатах дашборд не показывает: считаем только контакты.
 Нет строки — нет данных, а не ноль: пропущенный день остаётся разрывом на
 графике, пустая колонка — прочерком.
 """
@@ -14,7 +15,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from avito.ui.common import DASH, NBSP, PALETTE, fmt_int, fmt_money, fmt_pct
+from avito.ui.common import PALETTE, fmt_int, fmt_money, fmt_pct
 
 GREEN, YELLOW, RED, GREY = "#00A87E", "#F2A93B", "#D9534F", "#A0A7B4"
 
@@ -65,15 +66,6 @@ def _text(value) -> str:
     return "" if value is None or pd.isna(value) else str(value)
 
 
-def _ids(value) -> list[str]:
-    return [i.strip() for i in str(value or "").split(",") if i.strip()]
-
-
-def _signed(value: float, unit: str = "") -> str:
-    text = f"{value:+,.0f}".replace(",", NBSP)
-    return f"{text}{NBSP}{unit}" if unit else text
-
-
 def _gapped_lines(figure: go.Figure, frame: pd.DataFrame, value: str,
                   days: pd.DatetimeIndex, hover: str) -> None:
     """Линия на аккаунт; дни без строки остаются разрывом, а не соединяются."""
@@ -85,135 +77,6 @@ def _gapped_lines(figure: go.Figure, frame: pd.DataFrame, value: str,
             line={"color": PALETTE[i % len(PALETTE)]}, connectgaps=False,
             hovertemplate=f"%{{x|%d.%m}} · {escape(account)}: {hover}<extra></extra>",
         ))
-
-
-# --- план/факт ---------------------------------------------------------------
-
-def plan_fact_block(plan: dict[str, pd.DataFrame]) -> None:
-    st.subheader("План/факт")
-    windows = plan["windows"]
-    if windows.empty:
-        _no_data("План/факт")
-        return
-    for window in windows.to_dict("records"):
-        _plan_window(window, plan["curve"], plan["chats"], plan["kassa"])
-
-
-def _plan_window(window: dict, curve: pd.DataFrame, chats: pd.DataFrame,
-                 kassa: pd.DataFrame) -> None:
-    ids = _ids(window["avito_ids"])
-    first, last = pd.Timestamp(window["date_from"]), pd.Timestamp(window["date_to"])
-    target = float(window["target_chats"])
-    cap = float(window["cpl_cap_rub"])
-
-    def inside(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        return df[df["avito_id"].isin(ids) & df["stat_date"].between(first, last)]
-
-    chats, kassa = inside(chats), inside(kassa)
-    if not curve.empty:
-        curve = curve[curve["window_id"] == window["window_id"]]
-
-    st.markdown(f"**{window['title']}** · {first:%d.%m} – {last:%d.%m.%Y} · "
-                f"цель {fmt_int(target)} чатов, потолок цены {fmt_money(cap)}")
-
-    fact_day = chats["stat_date"].max() if not chats.empty else None
-    daily = pd.DataFrame()
-    if fact_day is not None:
-        daily = (chats.groupby("stat_date")
-                 .agg(chats=("chats", "sum"), accounts=("avito_id", "nunique"))
-                 .reindex(pd.date_range(first, fact_day)))
-        daily["fact_cum"] = daily["chats"].fillna(0).cumsum().where(daily["chats"].notna())
-
-    fact = float(chats["chats"].sum()) if not chats.empty else None
-    plan_now = None
-    if fact_day is not None and not curve.empty:
-        on_day = curve.loc[curve["stat_date"] == fact_day, "plan_chats_cum"]
-        plan_now = float(on_day.iloc[0]) if not on_day.empty else None
-
-    # Цена — по тем дням и кабинетам, где есть и касса, и чаты.
-    price = None
-    if not chats.empty and not kassa.empty:
-        paired = chats.merge(kassa[["stat_date", "avito_id", "spend_rub"]],
-                             on=["stat_date", "avito_id"])
-        if paired["chats"].sum() > 0:
-            price = paired["spend_rub"].sum() / paired["chats"].sum()
-
-    forecast = window.get("forecast_chats")
-    forecast = None if forecast is None or pd.isna(forecast) else float(forecast)
-    forecast_note = _text(window.get("forecast_note"))
-
-    cells = st.columns(4)
-    cells[0].metric(
-        f"Факт на {fact_day:%d.%m}" if fact_day is not None else "Факт",
-        fmt_int(fact) if fact is not None else DASH,
-        delta=_signed(fact - plan_now, "к плану") if None not in (fact, plan_now) else None,
-        help="Накопленная сумма чатов по кабинетам окна с первого дня.",
-    )
-    left = target - (fact or 0)
-    days_left = (last - fact_day).days if fact_day is not None else (last - first).days + 1
-    cells[1].metric(
-        "Осталось набрать", fmt_int(max(left, 0)),
-        help=f"Дней до конца окна: {days_left}.",
-    )
-    cells[2].metric(
-        "Прогноз на конец окна", fmt_int(forecast) if forecast is not None else DASH,
-        delta=_signed(forecast - target, "к цели") if forecast is not None else None,
-        help=forecast_note or None,
-    )
-    cells[3].metric(
-        "Цена чата", fmt_money(price) if price is not None else DASH,
-        delta=_signed(price - cap, "₽ к потолку") if price is not None else None,
-        delta_color="inverse",
-    )
-
-    figure = go.Figure()
-    if not curve.empty:
-        figure.add_trace(go.Scatter(
-            x=curve["stat_date"], y=curve["plan_chats_cum"], name="План",
-            mode="lines", line={"color": GREY, "dash": "dash"},
-            hovertemplate="%{x|%d.%m} · план %{y:.0f}<extra></extra>",
-        ))
-    if not daily.empty:
-        figure.add_trace(go.Scatter(
-            x=daily.index, y=daily["fact_cum"], name="Факт", mode="lines+markers",
-            line={"color": PALETTE[0], "width": 3}, connectgaps=False,
-            customdata=daily["chats"],
-            hovertemplate="%{x|%d.%m} · факт %{y:.0f} (+%{customdata:.0f})<extra></extra>",
-        ))
-    if forecast is not None:
-        figure.add_trace(go.Scatter(
-            x=[last], y=[forecast], name="Прогноз", mode="markers",
-            marker={"symbol": "diamond", "size": 12, "color": YELLOW},
-            hovertemplate="прогноз %{y:.0f}<extra></extra>",
-        ))
-    figure.add_hline(y=target, line={"color": GREEN, "dash": "dot", "width": 1})
-    figure.update_layout(height=320, margin=MARGIN, hovermode="x unified",
-                         legend={"orientation": "h", "y": 1.12})
-    figure.update_xaxes(range=[first - timedelta(days=1), last + timedelta(days=1)],
-                        tickformat="%d.%m")
-    st.plotly_chart(figure, width="stretch")
-
-    notes = []
-    if fact is not None and days_left > 0 and left > 0:
-        notes.append(f"нужно {left / days_left:.1f}".replace(".", ",")
-                     + " чата в день до конца окна")
-    if not daily.empty:
-        missing = int(daily["chats"].isna().sum())
-        partial = int((daily["accounts"] < len(ids)).sum()) - missing
-        if missing:
-            notes.append(f"дней без данных: {missing}")
-        if partial > 0:
-            notes.append(f"дней, где записаны не все кабинеты: {partial} — факт занижен")
-    if fact is None:
-        notes.append("чатов по кабинетам окна пока нет")
-    if forecast_note:
-        notes.append(f"прогноз: {forecast_note}")
-    stamp = _freshness(pd.DataFrame([window]), chats)
-    if stamp:
-        notes.append(stamp)
-    st.caption(" · ".join(notes))
 
 
 # --- касса -------------------------------------------------------------------
@@ -251,8 +114,6 @@ def kassa_block(kassa: pd.DataFrame) -> None:
                 details = []
                 if _text(row["deposits_detail"]):
                     details.append(f"внесения: {_text(row['deposits_detail'])}")
-                if pd.notna(row["last_chat_hour"]):
-                    details.append(f"последний чат в {int(row['last_chat_hour'])}:00")
                 if pd.notna(row["balance_rub"]):
                     details.append(f"кошелёк утром {fmt_money(row['balance_rub'])}")
                 if details:
@@ -272,7 +133,6 @@ def kassa_block(kassa: pd.DataFrame) -> None:
             "Когда": table["deposits_detail"],
             "Расход": table["spend_rub"].map(fmt_money),
             "Остаток": table["left_rub"].map(fmt_money),
-            "Посл. чат, ч": table["last_chat_hour"].map(fmt_int),
             "Сутки": table["full_day"].map({1: "полные", 0: "неполные"}),
             "Вердикт": table["verdict"],
             "Пометка": table["note"].fillna(""),
@@ -303,109 +163,6 @@ def _verdict_matrix(kassa: pd.DataFrame) -> None:
     figure.update_yaxes(categoryorder="array", categoryarray=accounts[::-1])
     figure.update_xaxes(tickformat="%d.%m")
     st.plotly_chart(figure, width="stretch")
-
-
-# --- чаты --------------------------------------------------------------------
-
-def chats_block(chats: pd.DataFrame, kassa: pd.DataFrame) -> None:
-    st.subheader("Чаты")
-    if chats.empty:
-        _no_data("Чаты")
-        return
-
-    money = (kassa[["stat_date", "avito_id", "spend_rub", "full_day"]]
-             if not kassa.empty else
-             pd.DataFrame(columns=["stat_date", "avito_id", "spend_rub", "full_day"]))
-    rows = chats.merge(money, on=["stat_date", "avito_id"], how="left")
-    paid = rows.dropna(subset=["spend_rub"])
-
-    total = float(rows["chats"].sum())
-
-    def share(column: str):
-        known = rows.dropna(subset=[column])
-        if known.empty or known["chats"].sum() == 0:
-            return None
-        return float(known[column].sum()) / float(known["chats"].sum())
-
-    price = (paid["spend_rub"].sum() / paid["chats"].sum()
-             if not paid.empty and paid["chats"].sum() > 0 else None)
-
-    figures = [
-        [("Чатов", fmt_int(total)),
-         ("Цена чата", fmt_money(price) if price is not None else DASH),
-         ("Вечером, 19–23", fmt_pct(share("chats_evening"))),
-         ("Ночью, 00–07", fmt_pct(share("chats_night")))],
-        [("Молчуны", fmt_pct(share("chats_silent"))),
-         ("Оставили телефон", fmt_pct(share("chats_phone_left"))),
-         ("Дней с данными", fmt_int(rows["stat_date"].nunique())),
-         ("Неполных суток", fmt_int((rows["full_day"] == 0).sum()))],
-    ]
-    for line in figures:
-        for cell, (label, value) in zip(st.columns(4), line):
-            cell.metric(label, value)
-
-    days = pd.date_range(rows["stat_date"].min(), rows["stat_date"].max())
-    left, right = st.columns(2)
-    with left:
-        # Штриховка — сутки, когда аванс кончился до полуночи; точки — кассы нет.
-        figure = go.Figure()
-        for i, (account, part) in enumerate(rows.groupby("account")):
-            shape = part["full_day"].map({1: "", 0: "/"}).fillna(".")
-            figure.add_trace(go.Bar(
-                x=part["stat_date"], y=part["chats"], name=account,
-                marker={"color": PALETTE[i % len(PALETTE)],
-                        "pattern": {"shape": shape.tolist(), "solidity": 0.45}},
-                customdata=part["full_day"].map(
-                    {1: "", 0: " · аванс кончился"}).fillna(" · кассы нет"),
-                hovertemplate=(f"%{{x|%d.%m}} · {escape(account)}: %{{y}}"
-                               "%{customdata}<extra></extra>"),
-            ))
-        figure.update_layout(barmode="stack", height=340, margin=MARGIN, bargap=0.15,
-                             title="Чаты по дням",
-                             legend={"orientation": "h", "y": -0.15})
-        figure.update_xaxes(tickformat="%d.%m")
-        st.plotly_chart(figure, width="stretch")
-    with right:
-        if paid.empty:
-            st.info("Цена чата появится, когда за эти дни будет записана касса.")
-        else:
-            priced = paid.assign(price=paid["spend_rub"] / paid["chats"].where(paid["chats"] > 0))
-            figure = go.Figure()
-            _gapped_lines(figure, priced, "price", days, "%{y:,.0f} ₽")
-            figure.update_layout(height=340, margin=MARGIN, title="Цена чата по дням, ₽",
-                                 hovermode="x unified",
-                                 legend={"orientation": "h", "y": -0.15})
-            figure.update_xaxes(tickformat="%d.%m")
-            st.plotly_chart(figure, width="stretch")
-
-    by_account = rows.groupby("account").agg(
-        chats=("chats", "sum"), evening=("chats_evening", "sum"),
-        night=("chats_night", "sum"),
-        silent=("chats_silent", lambda s: s.sum(min_count=1)),
-        phone=("chats_phone_left", lambda s: s.sum(min_count=1)),
-        days=("stat_date", "nunique"),
-    )
-    spend = paid.groupby("account").agg(spend=("spend_rub", "sum"),
-                                        paid_chats=("chats", "sum"))
-    by_account = by_account.join(spend).reset_index().sort_values("chats", ascending=False)
-    by_account["price"] = by_account["spend"] / by_account["paid_chats"].where(
-        by_account["paid_chats"] > 0)
-    st.dataframe(pd.DataFrame({
-        "Аккаунт": by_account["account"],
-        "Дней": by_account["days"].map(fmt_int),
-        "Чатов": by_account["chats"].map(fmt_int),
-        "Вечером": by_account["evening"].map(fmt_int),
-        "Ночью": by_account["night"].map(fmt_int),
-        "Молчуны": by_account["silent"].map(fmt_int),
-        "Телефон": by_account["phone"].map(fmt_int),
-        "Расход": by_account["spend"].map(fmt_money),
-        "Цена чата": by_account["price"].map(fmt_money),
-    }), width="stretch", hide_index=True)
-    st.caption("Чаты — зачётная метрика плана. Это не «Контакты» из выгрузки "
-               "(там чаты плюс показы телефона), складывать их нельзя. Цена чата — "
-               "расход кассы ÷ чаты за те же дни. Штриховка — аванс кончился "
-               f"раньше полуночи, провал там не означает упавший спрос. "
-               f"{_freshness(chats)}")
 
 
 # --- инвентарь ---------------------------------------------------------------

@@ -15,12 +15,12 @@ import streamlit as st
 
 from avito import metrics
 from avito.ui.avitolog import (
-    add_batch_marks, add_short_day_marks, chats_block, inventory_block,
-    kassa_block, plan_fact_block,
+    add_batch_marks, add_short_day_marks, inventory_block,
+    kassa_block,
 )
 from avito.ui.common import (
     DASH, PALETTE, bump_data_version, cached_bounds, cached_calls,
-    cached_contract, cached_contract_bounds, cached_daily, cached_plan,
+    cached_contract, cached_contract_bounds, cached_daily,
     data_version, fmt_int, fmt_money, fmt_pct,
 )
 
@@ -470,9 +470,6 @@ def dashboard_page(engine) -> None:
     version = data_version()
 
     st.header("Дашборд")
-    # План/факт живёт в своём окне дат и от календаря периода не зависит.
-    plan_fact_block(cached_plan(engine, version))
-    st.divider()
 
     bounds = _merge_bounds(cached_bounds(engine, version),
                            cached_contract_bounds(engine, version))
@@ -506,7 +503,7 @@ def dashboard_page(engine) -> None:
         filtered = rows[mask].copy()
     if chosen_regions:
         st.caption("Фильтр по регионам действует только на блоки по выгрузкам: "
-                   "в кассе, чатах и инвентаре региона нет.")
+                   "в кассе и инвентаре региона нет.")
 
     if filtered.empty:
         st.warning("Выгрузок статистики объявлений по выбранным фильтрам нет — "
@@ -517,8 +514,6 @@ def dashboard_page(engine) -> None:
 
     st.divider()
     kassa_block(contract["kassa"])
-    st.divider()
-    chats_block(contract["chats"], contract["kassa"])
 
     if not filtered.empty:
         st.divider()
