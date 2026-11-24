@@ -118,21 +118,29 @@ def _period_picker(first: date, last: date) -> tuple[date, date]:
     return chosen[0], chosen[1]
 
 
-def _filters(rows: pd.DataFrame, extra_accounts: set[str]) -> tuple[list[str], list[str]]:
-    """Выбранные аккаунты и регионы.
+def _filters(rows: pd.DataFrame,
+             extra_accounts: set[str]) -> tuple[list[str], list[str], list[str]]:
+    """Выбранные аккаунты, регионы и предметы.
 
     Аккаунты — из выгрузок и из таблиц AI Avitolog: касса может прийти за
-    день, выгрузки за который ещё нет. Регион есть только в выгрузках.
+    день, выгрузки за который ещё нет. Регион и предмет есть только в выгрузках.
     """
     accounts = sorted(set(rows["account"].unique() if not rows.empty else [])
                       | extra_accounts)
-    left, right = st.columns([2, 1.4])
+    left, middle, right = st.columns([2, 1.4, 1.2])
     with left:
         chosen_accounts = st.multiselect("Аккаунты", accounts, default=accounts)
-    with right:
+    with middle:
         regions = sorted(rows["region"].dropna().unique()) if not rows.empty else []
         chosen_regions = st.multiselect("Регионы", regions, placeholder="Все регионы")
-    return chosen_accounts, chosen_regions
+    with right:
+        present = set(rows["subject"].unique()) if not rows.empty else set()
+        subjects = [s for s in metrics.SUBJECTS if s in present]
+        chosen_subjects = st.multiselect(
+            "Предметы", subjects, placeholder="Все предметы",
+            help="Предмет — по названию объявления: «русск» — русский, "
+                 "«физик» — физика, остальное — математика.")
+    return chosen_accounts, chosen_regions, chosen_subjects
 
 
 def _merge_bounds(*bounds) -> tuple[date, date] | None:
@@ -260,13 +268,18 @@ def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame,
         return
 
     st.subheader("Динамика")
+    by_subject_possible = rows["subject"].nunique() > 1
     left, right = st.columns([2, 1.4])
     with left:
-        choice = st.radio(
-            "Показатель",
-            ["Контакты", "Звонки", "Расходы, ₽", "Цена контакта, ₽"],
-            horizontal=True, label_visibility="collapsed",
-        )
+        # Звонки вносятся по аккаунту, а не по предмету: в разрезе предметов их нет.
+        split = (st.radio("Разрез", ["По аккаунтам", "По предметам"], horizontal=True,
+                          label_visibility="collapsed", key="dynamics_split")
+                 if by_subject_possible else "По аккаунтам")
+        by_subject = split == "По предметам"
+        options = ["Контакты", "Расходы, ₽", "Цена контакта, ₽"] if by_subject else \
+            ["Контакты", "Звонки", "Расходы, ₽", "Цена контакта, ₽"]
+        choice = st.radio("Показатель", options, horizontal=True,
+                          label_visibility="collapsed")
     with right:
         grain = st.radio("Шаг", list(GRANULARITY), horizontal=True,
                          label_visibility="collapsed")
@@ -274,6 +287,9 @@ def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame,
     freq = GRANULARITY[grain]
     daily = rows.copy()
     daily["bucket"] = metrics.bucket(daily["stat_date"], freq)
+    if by_subject:
+        _subject_dynamics(daily, choice, freq, batches)
+        return
     agg = metrics.aggregate(daily, ["bucket", "account"])
 
     if not calls_days.empty:
@@ -301,6 +317,28 @@ def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame,
     if not batches.empty:
         st.caption("◆ и пунктир — партии изменений ставок: наведите на ромб, "
                    "чтобы увидеть, что меняли и почему.")
+
+
+def _subject_dynamics(daily: pd.DataFrame, choice: str, freq: str,
+                      batches: pd.DataFrame) -> None:
+    """Контакты и расходы — столбцами по предметам, цена контакта — линиями."""
+    agg = metrics.add_derived(metrics.aggregate(daily, ["bucket", "subject"]))
+    column = {v: k for k, v in metrics.RU_LABELS.items()}[choice]
+    labels = {column: choice, "subject": "Предмет", "bucket": ""}
+    order = {"subject": [s for s in metrics.SUBJECTS if s in set(agg["subject"])]}
+    if column == "cost_per_contact":
+        figure = px.line(agg.sort_values("bucket"), x="bucket", y=column,
+                         color="subject", markers=True, labels=labels,
+                         color_discrete_map=SUBJECT_COLORS, category_orders=order)
+        figure.update_layout(hovermode="x unified")
+    else:
+        figure = px.bar(agg, x="bucket", y=column, color="subject", labels=labels,
+                        color_discrete_map=SUBJECT_COLORS, category_orders=order)
+        figure.update_layout(barmode="stack", hovermode="x unified", bargap=0.15)
+    add_batch_marks(figure, batches)
+    figure.update_layout(height=340, margin={"l": 10, "r": 10, "t": 30, "b": 10})
+    figure.update_xaxes(tickformat="%d.%m.%Y" if freq != "M" else "%m.%Y")
+    st.plotly_chart(figure, width="stretch")
 
 
 GEO_METRICS = ["Расходы", "Контакты", "Конверсия"]
@@ -490,8 +528,9 @@ def dashboard_page(engine) -> None:
         return
     if not rows.empty:
         rows[["region", "city"]] = rows[["region", "city"]].fillna(NO_GEO)
+        rows["subject"] = metrics.subject_of(rows["title"])
 
-    chosen_accounts, chosen_regions = _filters(rows, contract_accounts)
+    chosen_accounts, chosen_regions, chosen_subjects = _filters(rows, contract_accounts)
     contract = {name: frame[frame["account"].isin(chosen_accounts)]
                 if not frame.empty else frame
                 for name, frame in contract.items()}
@@ -500,10 +539,12 @@ def dashboard_page(engine) -> None:
         mask = rows["account"].isin(chosen_accounts)
         if chosen_regions:
             mask &= rows["region"].isin(chosen_regions)
+        if chosen_subjects:
+            mask &= rows["subject"].isin(chosen_subjects)
         filtered = rows[mask].copy()
-    if chosen_regions:
-        st.caption("Фильтр по регионам действует только на блоки по выгрузкам: "
-                   "в кассе и инвентаре региона нет.")
+    if chosen_regions or chosen_subjects:
+        st.caption("Фильтры по регионам и предметам действуют только на блоки по "
+                   "выгрузкам: в кассе и инвентаре их нет.")
 
     if filtered.empty:
         st.warning("Выгрузок статистики объявлений по выбранным фильтрам нет — "
@@ -511,6 +552,7 @@ def dashboard_page(engine) -> None:
     else:
         calls_accounts, calls_days = _calls_in_view(engine, version, filtered, start, end)
         _listing_overview(filtered, calls_accounts, start, end)
+        _subjects(filtered)
 
     st.divider()
     kassa_block(contract["kassa"])
@@ -565,3 +607,88 @@ def _listing_overview(filtered: pd.DataFrame, calls_accounts: pd.DataFrame,
         _funnel(totals, has_calls)
     with right:
         _account_comparison_summary(filtered)
+
+
+SUBJECT_COLORS = {metrics.MATH: PALETTE[0], "Русский": PALETTE[2], "Физика": PALETTE[1]}
+SUBJECT_ALL = "Все карточки"
+SUBJECT_FRESH = f"Только новые (с {metrics.FRESH_FROM:%d.%m})"
+
+
+def _per_hundred(value) -> str:
+    """Контактов на 100 объявлений в день: два знака, иначе всё округлится к 1."""
+    if value is None or pd.isna(value):
+        return DASH
+    return f"{value:.2f}".replace(".", ",")
+
+
+def _subject_frame(rows: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    agg = metrics.add_derived(metrics.aggregate(rows, by))
+    # Контакт на 100 объявлений в день = контакты ÷ строки выгрузки × 100:
+    # одна строка — одно объявление за один день.
+    agg["per_hundred"] = 100 * agg["contacts"] / agg["rows"].where(agg["rows"] > 0)
+    order = {name: i for i, name in enumerate(metrics.SUBJECTS)}
+    return agg.sort_values("subject", key=lambda s: s.map(order))
+
+
+def _subjects(rows: pd.DataFrame) -> None:
+    """Карточка на предмет: сколько контактов, почём и с какой отдачей."""
+    present = set(rows["subject"].unique())
+    if present == {metrics.MATH}:
+        return  # до первого залива второго предмета сравнивать нечего
+
+    st.divider()
+    head, mode_cell = st.columns([1, 1.4], vertical_alignment="bottom")
+    head.subheader("По предметам")
+    mode = mode_cell.radio("Какие карточки", [SUBJECT_ALL, SUBJECT_FRESH],
+                           horizontal=True, label_visibility="collapsed",
+                           key="subject_mode")
+    data = rows
+    if mode == SUBJECT_FRESH:
+        published = pd.to_datetime(rows["first_published"], errors="coerce")
+        data = rows[published >= metrics.FRESH_FROM]
+        if data.empty:
+            st.info(f"Объявлений, впервые опубликованных с "
+                    f"{metrics.FRESH_FROM:%d.%m.%Y}, в выбранном периоде нет "
+                    "(или в выгрузках не заполнена дата первой публикации).")
+            return
+
+    agg = _subject_frame(data, ["subject"])
+    total = agg["contacts"].sum()
+    for cell, row in zip(st.columns(len(agg)), agg.to_dict("records")):
+        name = row["subject"]
+        since = metrics.SUBJECT_START.get(name)
+        with cell.container(border=True):
+            st.markdown(
+                f"<span style='color:{SUBJECT_COLORS.get(name, PALETTE[3])}'>●</span> "
+                f"**{name}** · {fmt_int(row['listings_per_day'])} объявл. в день"
+                + (f" · с {since:%d.%m}" if since is not None else ""),
+                unsafe_allow_html=True)
+            share = row["contacts"] / total if total else None
+            st.metric(f"Контакты · {fmt_pct(share, 0)} всех", fmt_int(row["contacts"]))
+            st.markdown(
+                f"**{fmt_money(row['cost_per_contact'])}** за контакт  \n"
+                f"Просмотр → контакт {fmt_pct(row['cr_views_contacts'])} · "
+                f"{_per_hundred(row['per_hundred'])} на 100 объявл. в день")
+
+    note = ("Новые карточки дают меньше контактов, чем старые, а математика в "
+            "среднем старше. Сравнивать предметы честно в режиме "
+            f"«{SUBJECT_FRESH}» — по дате первой публикации.")
+    if mode == SUBJECT_FRESH:
+        note = (f"Только объявления, впервые опубликованные с "
+                f"{metrics.FRESH_FROM:%d.%m.%Y}: так предметы одного возраста.")
+    st.caption(note)
+
+    with st.expander("Аккаунт × предмет"):
+        by = _subject_frame(data, ["account", "subject"])
+        by = by.sort_values(["account", "subject"],
+                            key=lambda s: s.map({n: i for i, n in enumerate(metrics.SUBJECTS)})
+                            if s.name == "subject" else s)
+        st.dataframe(_format_table(by, [
+            ("account", "Аккаунт", None), ("subject", "Предмет", None),
+            ("listings_per_day", "Объявлений в день", fmt_int),
+            ("views", "Просмотры", fmt_int), ("contacts", "Контакты", fmt_int),
+            ("spend_total", "Расходы", fmt_money),
+            ("cost_per_contact", "Цена контакта", fmt_money),
+            ("cr_views_contacts", "Просмотр → контакт", fmt_pct),
+            ("per_hundred", "На 100 объявл. в день", _per_hundred),
+        ]), width="stretch", hide_index=True)

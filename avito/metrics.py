@@ -35,6 +35,28 @@ RU_LABELS = {
 }
 
 
+# Предмет объявления — по метке в названии, тем же правилом, что в AI Avitolog
+# (app/predmety.py, SUBJECTS в app/zaliv_plan.py): «русск» → русский,
+# «физик» → физика, без метки — математика. Порядок — порядок показа.
+MATH = "Математика"
+SUBJECT_MARKS = {"Русский": "русск", "Физика": "физик"}
+SUBJECTS = [MATH, *SUBJECT_MARKS]
+# Первый залив предмета: подпись «с 18.11» у новых предметов.
+SUBJECT_START = {"Русский": pd.Timestamp("2026-11-18"),
+                 "Физика": pd.Timestamp("2026-11-23")}
+# Сравнивать предметы честно только на карточках одного возраста: конверсия
+# растёт с возрастом карточки. База AI Avitolog — карточки с 17.11.
+FRESH_FROM = pd.Timestamp("2026-11-17")
+
+
+def subject_of(titles: pd.Series) -> pd.Series:
+    lower = titles.fillna("").astype(str).str.lower()
+    out = pd.Series(MATH, index=titles.index)
+    for name, mark in SUBJECT_MARKS.items():
+        out = out.mask(lower.str.contains(mark, regex=False) & (out == MATH), name)
+    return out
+
+
 def _safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     """Деление с NaN вместо бесконечности — 0 контактов не значит цена 0."""
     num = pd.to_numeric(numerator, errors="coerce")
