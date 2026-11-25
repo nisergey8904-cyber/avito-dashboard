@@ -79,6 +79,14 @@ def cached_contract(_engine, version: int, start: date,
     }
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_cpl_targets(_engine, version: int) -> pd.DataFrame:
+    try:
+        return db.load_cpl_targets(_engine)
+    except Exception:  # noqa: BLE001 — без таблицы блок берёт планки по умолчанию
+        return pd.DataFrame(columns=["valid_from", "segment", "target_cpl_rub"])
+
+
 def data_version() -> int:
     """Счётчик, по которому сбрасывается кэш после изменения данных."""
     return st.session_state.get("data_version", 0)

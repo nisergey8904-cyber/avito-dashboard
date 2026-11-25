@@ -20,7 +20,7 @@ from avito.ui.avitolog import (
 )
 from avito.ui.common import (
     DASH, PALETTE, bump_data_version, cached_bounds, cached_calls,
-    cached_contract, cached_contract_bounds, cached_daily,
+    cached_contract, cached_contract_bounds, cached_cpl_targets, cached_daily,
     data_version, fmt_int, fmt_money, fmt_pct,
 )
 
@@ -118,16 +118,19 @@ def _period_picker(first: date, last: date) -> tuple[date, date]:
     return chosen[0], chosen[1]
 
 
+SEGMENT_ALL = "Все сегменты"
+
+
 def _filters(rows: pd.DataFrame,
-             extra_accounts: set[str]) -> tuple[list[str], list[str], list[str]]:
-    """Выбранные аккаунты, регионы и предметы.
+             extra_accounts: set[str]) -> tuple[list[str], list[str], list[str], str]:
+    """Выбранные аккаунты, регионы, предметы и сегмент.
 
     Аккаунты — из выгрузок и из таблиц AI Avitolog: касса может прийти за
     день, выгрузки за который ещё нет. Регион и предмет есть только в выгрузках.
     """
     accounts = sorted(set(rows["account"].unique() if not rows.empty else [])
                       | extra_accounts)
-    left, middle, right = st.columns([2, 1.4, 1.2])
+    left, middle, right, segment_cell = st.columns([2, 1.4, 1.2, 1.1])
     with left:
         chosen_accounts = st.multiselect("Аккаунты", accounts, default=accounts)
     with middle:
@@ -140,7 +143,14 @@ def _filters(rows: pd.DataFrame,
             "Предметы", subjects, placeholder="Все предметы",
             help="Предмет — по названию объявления: «русск» — русский, "
                  "«физик» — физика, остальное — математика.")
-    return chosen_accounts, chosen_regions, chosen_subjects
+    with segment_cell:
+        chosen_segment = st.selectbox(
+            "Сегмент", [SEGMENT_ALL, metrics.SEG_MSK, metrics.SEG_REGIONS],
+            key="segment_filter",
+            help="«Москва + МО» — регион «Москва» или «Московская область» "
+                 "(Зеленоград тоже здесь), «Регионы» — любой другой указанный "
+                 "регион. Строки без региона входят только во «Все сегменты».")
+    return chosen_accounts, chosen_regions, chosen_subjects, chosen_segment
 
 
 def _merge_bounds(*bounds) -> tuple[date, date] | None:
@@ -261,22 +271,26 @@ def _account_comparison(rows: pd.DataFrame, calls_accounts: pd.DataFrame) -> Non
 
 
 def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame,
-              batches: pd.DataFrame, kassa: pd.DataFrame) -> None:
+              batches: pd.DataFrame, kassa: pd.DataFrame,
+              targets: pd.DataFrame) -> None:
     if rows["stat_date"].nunique() < 2:
         st.caption("Динамика появится, когда в выбранном периоде будет больше "
                    "одного дня с данными.")
         return
 
     st.subheader("Динамика")
-    by_subject_possible = rows["subject"].nunique() > 1
+    splits = ["По аккаунтам", "По сегментам"]
+    if rows["subject"].nunique() > 1:
+        splits.append("По предметам")
     left, right = st.columns([2, 1.4])
     with left:
-        # Звонки вносятся по аккаунту, а не по предмету: в разрезе предметов их нет.
-        split = (st.radio("Разрез", ["По аккаунтам", "По предметам"], horizontal=True,
-                          label_visibility="collapsed", key="dynamics_split")
-                 if by_subject_possible else "По аккаунтам")
+        # Звонки вносятся по аккаунту, без предмета и географии: в разрезах
+        # предметов и сегментов их нет.
+        split = st.radio("Разрез", splits, horizontal=True,
+                         label_visibility="collapsed", key="dynamics_split")
         by_subject = split == "По предметам"
-        options = ["Контакты", "Расходы, ₽", "Цена контакта, ₽"] if by_subject else \
+        by_segment = split == "По сегментам"
+        options = ["Контакты", "Расходы, ₽", "Цена контакта, ₽"] if by_subject or by_segment else \
             ["Контакты", "Звонки", "Расходы, ₽", "Цена контакта, ₽"]
         choice = st.radio("Показатель", options, horizontal=True,
                           label_visibility="collapsed")
@@ -289,6 +303,9 @@ def _dynamics(rows: pd.DataFrame, calls_days: pd.DataFrame,
     daily["bucket"] = metrics.bucket(daily["stat_date"], freq)
     if by_subject:
         _subject_dynamics(daily, choice, freq, batches)
+        return
+    if by_segment:
+        _segment_dynamics(daily, choice, freq, batches, targets)
         return
     agg = metrics.aggregate(daily, ["bucket", "account"])
 
@@ -529,8 +546,10 @@ def dashboard_page(engine) -> None:
     if not rows.empty:
         rows[["region", "city"]] = rows[["region", "city"]].fillna(NO_GEO)
         rows["subject"] = metrics.subject_of(rows["title"])
+        rows["segment"] = metrics.segment_of(rows["region"], NO_GEO)
 
-    chosen_accounts, chosen_regions, chosen_subjects = _filters(rows, contract_accounts)
+    chosen_accounts, chosen_regions, chosen_subjects, chosen_segment = _filters(
+        rows, contract_accounts)
     contract = {name: frame[frame["account"].isin(chosen_accounts)]
                 if not frame.empty else frame
                 for name, frame in contract.items()}
@@ -541,10 +560,13 @@ def dashboard_page(engine) -> None:
             mask &= rows["region"].isin(chosen_regions)
         if chosen_subjects:
             mask &= rows["subject"].isin(chosen_subjects)
+        if chosen_segment != SEGMENT_ALL:
+            mask &= rows["segment"] == chosen_segment
         filtered = rows[mask].copy()
-    if chosen_regions or chosen_subjects:
-        st.caption("Фильтры по регионам и предметам действуют только на блоки по "
-                   "выгрузкам: в кассе и инвентаре их нет.")
+    if chosen_regions or chosen_subjects or chosen_segment != SEGMENT_ALL:
+        st.caption("Фильтры по регионам, предметам и сегменту действуют только на "
+                   "блоки по выгрузкам: в кассе и инвентаре их нет.")
+    targets = cached_cpl_targets(engine, version)
 
     if filtered.empty:
         st.warning("Выгрузок статистики объявлений по выбранным фильтрам нет — "
@@ -552,6 +574,7 @@ def dashboard_page(engine) -> None:
     else:
         calls_accounts, calls_days = _calls_in_view(engine, version, filtered, start, end)
         _listing_overview(filtered, calls_accounts, start, end)
+        _segments(filtered, targets, end)
         _subjects(filtered)
 
     st.divider()
@@ -562,7 +585,7 @@ def dashboard_page(engine) -> None:
         _account_comparison(filtered, calls_accounts)
         st.divider()
         _dynamics(filtered, calls_days,
-                  contract["batches"], contract["kassa"])
+                  contract["batches"], contract["kassa"], targets)
 
     st.divider()
     inventory_block(contract["inventory"])
@@ -692,3 +715,173 @@ def _subjects(rows: pd.DataFrame) -> None:
             ("cr_views_contacts", "Просмотр → контакт", fmt_pct),
             ("per_hundred", "На 100 объявл. в день", _per_hundred),
         ]), width="stretch", hide_index=True)
+
+
+# --- Сегменты: Москва + МО и регионы, каждый со своей планкой цены контакта ---
+
+SEGMENT_COLORS = {metrics.SEG_MSK: PALETTE[0], metrics.SEG_REGIONS: PALETTE[2],
+                  metrics.SEG_UNKNOWN: "#9AA3B2"}
+OVER_COLOR = "#D9534F"   # цена контакта выше планки
+UNDER_COLOR = "#00A87E"  # не выше планки
+
+
+def _segment_frame(rows: pd.DataFrame, by: list[str], targets: pd.DataFrame,
+                   day) -> pd.DataFrame:
+    """Метрики по сегменту (и, если задано, аккаунту) с планкой на день day.
+
+    Доли в расходе и контактах — внутри группы без сегмента: для блока это весь
+    выбранный срез, для таблицы «аккаунт × сегмент» — аккаунт.
+    """
+    agg = metrics.add_derived(metrics.aggregate(rows, by))
+    agg["target"] = agg["segment"].map(lambda s: metrics.target_on(targets, s, day))
+    agg["target"] = pd.to_numeric(agg["target"], errors="coerce")
+    agg["deviation"] = agg["cost_per_contact"] / agg["target"] - 1
+    parent = [c for c in by if c != "segment"]
+    for col, share in (("spend_total", "share_spend"), ("contacts", "share_contacts")):
+        total = (agg.groupby(parent)[col].transform("sum") if parent
+                 else pd.Series(agg[col].sum(), index=agg.index))
+        agg[share] = agg[col] / total.where(total > 0)
+    order = {name: i for i, name in enumerate(metrics.SEGMENTS)}
+    return agg.sort_values(parent + ["segment"],
+                           key=lambda s: s.map(order) if s.name == "segment" else s)
+
+
+def _fmt_deviation(value) -> str:
+    if value is None or pd.isna(value):
+        return DASH
+    return ("+" if value > 0 else "") + fmt_pct(value, 0)
+
+
+SEGMENT_TABLE = [
+    ("segment", "Сегмент", None),
+    ("views", "Просмотры", fmt_int), ("contacts", "Контакты", fmt_int),
+    ("cr_views_contacts", "Просмотр → контакт", fmt_pct),
+    ("spend_total", "Расходы", fmt_money),
+    ("cost_per_contact", "Цена контакта", fmt_money),
+    ("target", "Целевая цена", fmt_money),
+    ("deviation", "Отклонение от целевой", _fmt_deviation),
+    ("share_spend", "Доля в расходе", lambda v: fmt_pct(v, 0)),
+    ("share_contacts", "Доля в контактах", lambda v: fmt_pct(v, 0)),
+]
+
+
+def _segment_styled(agg: pd.DataFrame, spec: list[tuple]):
+    """Таблица с красной/зелёной ценой контакта и отклонением."""
+    shown = _format_table(agg, spec).reset_index(drop=True)
+    deviation = agg["deviation"].reset_index(drop=True)
+
+    def paint(frame: pd.DataFrame) -> pd.DataFrame:
+        css = pd.DataFrame("", index=frame.index, columns=frame.columns)
+        for column in ("Цена контакта", "Отклонение от целевой"):
+            if column not in css.columns:
+                continue
+            css[column] = [
+                "" if pd.isna(d) else
+                f"color: {OVER_COLOR if d > 0 else UNDER_COLOR}; font-weight: 600"
+                for d in deviation]
+        return css
+
+    return shown.style.apply(paint, axis=None)
+
+
+def _segments(rows: pd.DataFrame, targets: pd.DataFrame, end: date) -> None:
+    """Блок «Сегменты»: каждый сегмент рядом со своей планкой цены контакта."""
+    st.divider()
+    st.subheader("Сегменты")
+    agg = _segment_frame(rows, ["segment"], targets, end)
+
+    main = agg[agg["segment"].isin(metrics.SEGMENT_CODES)]
+    if not main.empty:
+        for cell, row in zip(st.columns(len(main)), main.to_dict("records")):
+            with cell.container(border=True):
+                st.markdown(
+                    f"<span style='color:{SEGMENT_COLORS[row['segment']]}'>●</span> "
+                    f"**{row['segment']}** · {fmt_pct(row['share_spend'], 0)} расхода, "
+                    f"{fmt_pct(row['share_contacts'], 0)} контактов",
+                    unsafe_allow_html=True)
+                delta = None
+                if not pd.isna(row["deviation"]):
+                    delta = (f"{_fmt_deviation(row['deviation'])} к планке "
+                             f"{fmt_money(row['target'])}")
+                st.metric("Цена контакта", fmt_money(row["cost_per_contact"]),
+                          delta=delta, delta_color="inverse")
+                st.caption(f"Контакты {fmt_int(row['contacts'])} · расход "
+                           f"{fmt_money(row['spend_total'])} · просмотр → контакт "
+                           f"{fmt_pct(row['cr_views_contacts'])}")
+
+    st.dataframe(_segment_styled(agg, SEGMENT_TABLE), width="stretch",
+                 hide_index=True)
+
+    source = ("из таблицы планок AI Avitolog" if metrics.targets_from_table(targets)
+              else "по умолчанию — таблица планок AI Avitolog пока пуста")
+    st.caption(
+        f"Целевая цена — на {end:%d.%m.%Y}, последний день периода ({source}). "
+        "Цена выше целевой — красным, не выше — зелёным. Общая цена контакта в "
+        "карточках выше — среднее по сегментам, с планкой её не сравниваем: она "
+        "зависит от доли расхода в столице. Касса по сегментам не делится — "
+        "здесь только расход по объявлениям.")
+
+    with st.expander("Аккаунт × сегмент"):
+        by = _segment_frame(rows, ["account", "segment"], targets, end)
+        spec = [("account", "Аккаунт", None)] + [
+            (col, "Доля в расходе аккаунта" if col == "share_spend" else
+             "Доля в контактах аккаунта" if col == "share_contacts" else label, fmt)
+            for col, label, fmt in SEGMENT_TABLE]
+        st.dataframe(_segment_styled(by, spec), width="stretch", hide_index=True)
+
+
+def _bucket_end(buckets: pd.Series, freq: str) -> pd.Series:
+    """Последний день шага: на него берётся планка в динамике."""
+    if freq == "W":
+        return buckets + pd.Timedelta(days=6)
+    if freq == "M":
+        return buckets + pd.offsets.MonthEnd(0)
+    return buckets
+
+
+def _segment_dynamics(daily: pd.DataFrame, choice: str, freq: str,
+                      batches: pd.DataFrame, targets: pd.DataFrame) -> None:
+    """Контакты и расходы — столбцами по сегментам, цена контакта — линиями с планкой."""
+    agg = metrics.add_derived(metrics.aggregate(daily, ["bucket", "segment"]))
+    column = {v: k for k, v in metrics.RU_LABELS.items()}[choice]
+    labels = {column: choice, "segment": "Сегмент", "bucket": ""}
+    present = set(agg["segment"])
+    if column == "cost_per_contact":
+        # У «Не указан» планки нет, а его цена контакта на малых числах шумит.
+        agg = agg[agg["segment"].isin(metrics.SEGMENT_CODES)]
+        order = {"segment": [s for s in metrics.SEGMENT_CODES if s in present]}
+        figure = px.line(agg.sort_values("bucket"), x="bucket", y=column,
+                         color="segment", markers=True, labels=labels,
+                         color_discrete_map=SEGMENT_COLORS, category_orders=order)
+        buckets = pd.Series(sorted(agg["bucket"].unique()))
+        ends = _bucket_end(buckets, freq)
+        # Каждый уровень рисуется на полшага в обе стороны от точки: так видна
+        # и ступень последнего шага, которую line_shape="hv" обрезал бы.
+        half = pd.Timedelta(hours={"D": 12, "W": 84, "M": 360}[freq])
+        for segment in order["segment"]:
+            xs, levels = [], []
+            for point, day in zip(buckets, ends):
+                level = metrics.target_on(targets, segment, day)
+                xs += [point - half, point + half]
+                levels += [level, level]
+            figure.add_trace(go.Scatter(
+                x=xs, y=levels, mode="lines",
+                name=f"Планка: {segment}",
+                line={"color": SEGMENT_COLORS[segment], "dash": "dash", "width": 1.5},
+                hovertemplate=f"Планка {segment}: %{{y:.0f}} ₽<extra></extra>",
+            ))
+        figure.update_layout(hovermode="x unified")
+    else:
+        order = {"segment": [s for s in metrics.SEGMENTS if s in present]}
+        figure = px.bar(agg, x="bucket", y=column, color="segment", labels=labels,
+                        color_discrete_map=SEGMENT_COLORS, category_orders=order)
+        figure.update_layout(barmode="stack", hovermode="x unified", bargap=0.15)
+    add_batch_marks(figure, batches)
+    figure.update_layout(height=340, margin={"l": 10, "r": 10, "t": 30, "b": 10})
+    figure.update_xaxes(tickformat="%d.%m.%Y" if freq != "M" else "%m.%Y")
+    st.plotly_chart(figure, width="stretch")
+    if column == "cost_per_contact":
+        step = {"W": "последний день недели", "M": "последний день месяца"}.get(freq)
+        st.caption("Пунктир — целевая цена сегмента"
+                   + (f" на {step}" if step else "")
+                   + ". Строки без региона в линии цены не входят.")

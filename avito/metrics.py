@@ -57,6 +57,46 @@ def subject_of(titles: pd.Series) -> pd.Series:
     return out
 
 
+# Сегмент — по региону строки (решение руководителя 25.11.2026): в Москве и
+# области контакт может стоить дороже, потому что там выше конверсия в сделку.
+# Зеленоград приходит с регионом «Москва». Пустой регион — вне сегментов.
+SEG_MSK = "Москва + МО"
+SEG_REGIONS = "Регионы"
+SEG_UNKNOWN = "Не указан"
+SEGMENTS = [SEG_MSK, SEG_REGIONS, SEG_UNKNOWN]
+MSK_REGIONS = {"Москва", "Московская область"}
+# Код сегмента в таблице cpl_targets.
+SEGMENT_CODES = {SEG_MSK: "msk_mo", SEG_REGIONS: "regions"}
+# Планки, пока cpl_targets пуста или в ней нет строки сегмента.
+DEFAULT_TARGETS = {SEG_MSK: 750.0, SEG_REGIONS: 650.0}
+
+
+def segment_of(regions: pd.Series, unknown: str = SEG_UNKNOWN) -> pd.Series:
+    """Сегмент строки. unknown — подпись пустого региона в данных."""
+    text = regions.fillna("").astype(str).str.strip()
+    out = pd.Series(SEG_REGIONS, index=regions.index)
+    out = out.mask(text.isin(MSK_REGIONS), SEG_MSK)
+    return out.mask((text == "") | (text == unknown), SEG_UNKNOWN)
+
+
+def target_on(targets: pd.DataFrame, segment: str, day) -> float | None:
+    """Планка сегмента на день: строка с наибольшим valid_from ≤ day."""
+    code = SEGMENT_CODES.get(segment)
+    if code is None:
+        return None
+    if targets is not None and not targets.empty:
+        own = targets[(targets["segment"] == code)
+                      & (targets["valid_from"] <= pd.Timestamp(day))]
+        if not own.empty:
+            return float(own.sort_values("valid_from")["target_cpl_rub"].iloc[-1])
+    return DEFAULT_TARGETS.get(segment)
+
+
+def targets_from_table(targets: pd.DataFrame) -> bool:
+    """Есть ли в cpl_targets хоть одна строка — для подписи об источнике планок."""
+    return targets is not None and not targets.empty
+
+
 def _safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     """Деление с NaN вместо бесконечности — 0 контактов не значит цена 0."""
     num = pd.to_numeric(numerator, errors="coerce")

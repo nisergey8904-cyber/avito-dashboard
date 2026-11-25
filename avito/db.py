@@ -188,8 +188,19 @@ plan_daily = Table(
     Column("loaded_at", DateTime, nullable=False),
 )
 
+# Целевая цена контакта сегмента. Для дня действует строка сегмента с
+# наибольшим valid_from, не превышающим этот день (см. CONTRACT.md).
+cpl_targets = Table(
+    "cpl_targets", metadata,
+    Column("valid_from", Date, primary_key=True),
+    Column("segment", String(16), primary_key=True),
+    Column("target_cpl_rub", Float, nullable=False),
+    Column("note", String(255)),
+    Column("loaded_at", DateTime, nullable=False),
+)
+
 CONTRACT_TABLES = (kassa_daily, chats_daily, inventory_daily, bid_batches,
-                   plan_windows, plan_daily)
+                   plan_windows, plan_daily, cpl_targets)
 
 # Поля строки объявления — всё, кроме служебных колонок дня.
 ROW_FIELDS = [c.name for c in daily_stats.columns
@@ -636,6 +647,19 @@ def load_inventory(engine: Engine, start: date | None = None,
 def load_bid_batches(engine: Engine, start: date | None = None,
                      end: date | None = None) -> pd.DataFrame:
     return _read_contract(engine, bid_batches, "batch_date", start, end)
+
+
+def load_cpl_targets(engine: Engine) -> pd.DataFrame:
+    """Вся история планок: valid_from, segment, target_cpl_rub. Таблица крошечная."""
+    query = select(cpl_targets.c.valid_from, cpl_targets.c.segment,
+                   cpl_targets.c.target_cpl_rub).order_by(cpl_targets.c.valid_from)
+    with engine.connect() as conn:
+        df = pd.DataFrame(conn.execute(query).mappings().all())
+    if df.empty:
+        return pd.DataFrame(columns=["valid_from", "segment", "target_cpl_rub"])
+    df["valid_from"] = pd.to_datetime(df["valid_from"])
+    df["target_cpl_rub"] = pd.to_numeric(df["target_cpl_rub"], errors="coerce")
+    return df.dropna(subset=["target_cpl_rub"])
 
 
 def contract_bounds(engine: Engine) -> tuple[date, date] | None:
